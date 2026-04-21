@@ -1,0 +1,2 @@
+- {FEATURE_DIR}/plan.md — 必须包含：概述、API 设计、核心流程、Server/MCP/Client/Engine 设计、测试计划、文件清单、合宪性自检
+- 复杂方案（模块 > 3 或 API > 5）额外输出 {FEATURE_DIR}/plan/*.md

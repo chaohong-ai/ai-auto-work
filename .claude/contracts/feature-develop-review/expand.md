@@ -1,0 +1,2 @@
+- {FEATURE_DIR}/plan/*.md — 仅当审查命中对应模块时读取
+- develop-log.md — 仅读取最近一轮

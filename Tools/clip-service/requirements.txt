@@ -1,0 +1,6 @@
+open-clip-torch>=2.24.0
+torch>=2.1.0
+fastapi>=0.108.0
+python-multipart>=0.0.6
+uvicorn>=0.25.0
+Pillow>=10.1.0

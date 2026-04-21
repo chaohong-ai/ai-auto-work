@@ -1,0 +1,3 @@
+- 代码文件（按 plan 文件清单和任务范围）
+- 测试文件（每个 Handler/Service 必须有对应测试）
+- {FEATURE_DIR}/develop-log.md（追加模式）

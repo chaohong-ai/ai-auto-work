@@ -1,0 +1,3 @@
+- {FEATURE_DIR}/plan.md — 技术规格（文件清单、依赖顺序、设计要点）
+- {FEATURE_DIR}/feature.md — 需求背景
+- 宪法已自动加载，不需要再读

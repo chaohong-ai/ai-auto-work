@@ -1,0 +1,3 @@
+- {FEATURE_DIR}/plan/ 子文件 — 仅复杂方案时生成
+- Docs/Engine/、Docs/Research/ — 仅 feature 涉及时搜索
+- 搜索项目中与本功能最相似的已有实现作为参考模板

@@ -1,0 +1,4 @@
+- 将 Review 报告写入 {REVIEW_FILE}（覆盖之前的报告）
+- 严重级分层：Critical / Important / Nice to have
+- Context Repairs 段必须存在（无则写 - 无）
+- 最后一行追加元数据 <!-- counts: critical=X important=Y nice=Z --> 用于脚本解析

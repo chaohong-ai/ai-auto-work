@@ -1,0 +1,2 @@
+- 搜索项目中与调研主题相关的已有实现
+- Docs/Engine/、Docs/Research/ — 仅已有相关文档时读取

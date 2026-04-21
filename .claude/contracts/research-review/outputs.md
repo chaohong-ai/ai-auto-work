@@ -1,0 +1,5 @@
+- 将 Review 报告写入 {REVIEW_FILE}（覆盖之前的报告）
+- 严重级分层：Critical / Important / Nice to have
+- 决策可靠度评分（1-5 星）
+- Context Repairs 段（无则写 - 无）
+- 最后一行追加：<!-- counts: critical=X important=Y nice=Z reliability=R -->

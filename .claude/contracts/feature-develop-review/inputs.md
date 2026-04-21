@@ -1,0 +1,4 @@
+- {FEATURE_DIR}/plan.md — 预期文件清单 + 设计基线
+- {FEATURE_DIR}/feature.md — REQ + 验收条件
+- 所有变更文件的完整代码（从 develop-log.md 或 git diff --name-only 获取列表）
+- 宪法已自动加载

@@ -1,0 +1,3 @@
+- {FEATURE_DIR}/plan.md — 待审查方案
+- {FEATURE_DIR}/feature.md（或 feature.json）— 需求基线
+- 宪法已自动加载，不需要再读

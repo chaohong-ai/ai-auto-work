@@ -1,0 +1,660 @@
+#!/usr/bin/env python3
+"""
+protoc-gen-gdscript  --  Generate GDScript proto classes from .proto files.
+
+  Standalone mode:
+    python3 protoc-gen-gdscript --proto_path=<dir> --gdscript_out=<dir>
+
+  Protoc plugin mode (invoked by protoc via --plugin):
+    protoc --plugin=protoc-gen-gdscript=<path> --gdscript_out=<out_dir> *.proto
+
+Supported field types: string  int32  int64  uint32  uint64  sint32  sint64  bool  bytes  float  double  enum
+Output: one <proto_name>_pb.gd file per .proto input file.
+Generated code is pure GDScript (Godot 4) -- no GDExtension required.
+"""
+
+import sys
+import os
+import re
+import glob
+import argparse
+from typing import List
+
+
+# ---------------------------------------------------------------------------
+# Type mappings
+# ---------------------------------------------------------------------------
+
+_GD_TYPE = {
+    "string":  "String",
+    "int32":   "int",
+    "int64":   "int",
+    "uint32":  "int",
+    "uint64":  "int",
+    "sint32":  "int",
+    "sint64":  "int",
+    "bool":    "bool",
+    "bytes":   "PackedByteArray",
+    "float":   "float",
+    "double":  "float",
+}
+
+_GD_DEFAULT = {
+    "String":          '""',
+    "int":             "0",
+    "bool":            "false",
+    "PackedByteArray": "PackedByteArray()",
+    "float":           "0.0",
+}
+
+_VARINT_TYPES = frozenset({"int32", "int64", "uint32", "uint64", "sint32", "sint64"})
+_SKIP_KEYWORDS = frozenset({
+    "option", "reserved", "extensions", "oneof", "map",
+    "syntax", "import", "package",
+})
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+class Field:
+    def __init__(self, type_name: str, name: str, number: int, repeated: bool = False, kind: str = "scalar"):
+        self.type_name = type_name
+        self.name = name
+        self.number = number
+        self.repeated = repeated
+        self.kind = kind  # "scalar" | "enum" | "message"
+
+
+class EnumValue:
+    def __init__(self, name: str, number: int):
+        self.name = name
+        self.number = number
+
+
+class Enum:
+    def __init__(self, name: str):
+        self.name = name
+        self.values: List[EnumValue] = []
+
+
+class Message:
+    def __init__(self, name: str):
+        self.name = name
+        self.fields: List[Field] = []
+
+
+class ProtoFile:
+    def __init__(self, path: str):
+        self.path = path
+        base = os.path.basename(path)
+        self.filename = base
+        self.base_name = base[:-6] if base.endswith(".proto") else base
+        self.package: str = ""
+        self.messages: List[Message] = []
+        self.enums: List[Enum] = []
+
+
+# ---------------------------------------------------------------------------
+# Proto parser
+# ---------------------------------------------------------------------------
+
+def _strip_comments(src: str) -> str:
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+    return src
+
+
+def _find_closing_brace(src: str, start: int) -> int:
+    """Return index of } matching { at src[start], or -1 if not found."""
+    depth = 0
+    for i in range(start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+_FIELD_RE = re.compile(
+    r"\b(repeated\s+|optional\s+)?"   # optional label (group 1)
+    r"(\w+)\s+"                         # type (group 2)
+    r"(\w+)\s*=\s*"                     # field name (group 3)
+    r"(\d+)"                            # field number (group 4)
+    r"(?:\s*\[[^\]]*\])?"               # inline options (ignored)
+    r"\s*;"
+)
+
+
+def _collect_top_level_enum_names(src: str) -> frozenset:
+    """Quick pre-scan: collect all top-level enum names from proto source."""
+    return frozenset(m.group(1) for m in re.finditer(r"\benum\s+(\w+)\s*\{", src))
+
+
+def _collect_top_level_message_names(src: str) -> frozenset:
+    """Quick pre-scan: collect all top-level message names from proto source."""
+    return frozenset(m.group(1) for m in re.finditer(r"\bmessage\s+(\w+)\s*\{", src))
+
+
+def _parse_message(inner: str, name: str, enum_names: frozenset = frozenset()) -> Message:
+    msg = Message(name)
+    # Collect ranges of nested message/enum blocks to skip
+    skip_ranges: List[tuple] = []
+    for m in re.finditer(r"\b(?:message|enum)\s+\w+\s*\{", inner):
+        bs = m.end() - 1
+        be = _find_closing_brace(inner, bs)
+        if be != -1:
+            skip_ranges.append((m.start(), be + 1))
+
+    for m in _FIELD_RE.finditer(inner):
+        if any(s <= m.start() < e for s, e in skip_ranges):
+            continue
+        label = (m.group(1) or "").strip()
+        type_name = m.group(2)
+        if type_name in _SKIP_KEYWORDS:
+            continue
+        field_name = m.group(3)
+        number = int(m.group(4))
+        # Determine field kind so that enum fields generate as varint (not nested message)
+        if type_name in _GD_TYPE:
+            kind = "scalar"
+        elif type_name in enum_names:
+            kind = "enum"
+        else:
+            kind = "message"
+        msg.fields.append(Field(type_name, field_name, number, label == "repeated", kind))
+    return msg
+
+
+def _parse_enum(inner: str, name: str) -> Enum:
+    enum = Enum(name)
+    for m in re.finditer(r"\b(\w+)\s*=\s*(\d+)\s*;", inner):
+        enum.values.append(EnumValue(m.group(1), int(m.group(2))))
+    return enum
+
+
+def parse_proto_file(path: str) -> ProtoFile:
+    """Parse a .proto file and return a ProtoFile object.
+
+    Raises ValueError if a field uses an unsupported type (not a scalar,
+    known enum, or message defined in this same file).
+    """
+    proto = ProtoFile(path)
+    with open(path, encoding="utf-8") as fh:
+        src = _strip_comments(fh.read())
+
+    m = re.search(r"\bpackage\s+(\S+)\s*;", src)
+    if m:
+        proto.package = m.group(1)
+
+    # Pre-scan enum and message names so _parse_message can classify fields correctly
+    enum_names = _collect_top_level_enum_names(src)
+    message_names = _collect_top_level_message_names(src)
+
+    i = 0
+    while i < len(src):
+        msg_m = re.search(r"\bmessage\s+(\w+)\s*\{", src[i:])
+        enu_m = re.search(r"\benum\s+(\w+)\s*\{", src[i:])
+
+        candidates = []
+        if msg_m:
+            candidates.append(("message", i + msg_m.start(), msg_m))
+        if enu_m:
+            candidates.append(("enum", i + enu_m.start(), enu_m))
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda x: x[1])
+        block_kind, abs_start, match = candidates[0]
+
+        # Position of the opening brace
+        brace_open = abs_start + (match.end() - match.start()) - 1
+        brace_close = _find_closing_brace(src, brace_open)
+        if brace_close == -1:
+            break
+
+        inner = src[brace_open + 1: brace_close]
+        if block_kind == "message":
+            proto.messages.append(_parse_message(inner, match.group(1), enum_names))
+        else:
+            proto.enums.append(_parse_enum(inner, match.group(1)))
+
+        i = brace_close + 1
+
+    # Validate: reject fields whose type cannot be generated correctly
+    for msg in proto.messages:
+        for f in msg.fields:
+            if f.kind == "message" and f.type_name not in message_names:
+                raise ValueError(
+                    f"{proto.filename}: field '{msg.name}.{f.name}' has unsupported type "
+                    f"'{f.type_name}' (not a scalar, known enum, or local message)"
+                )
+
+    return proto
+
+
+# ---------------------------------------------------------------------------
+# GDScript code generation
+# ---------------------------------------------------------------------------
+
+# These helper methods are inlined inside every generated class so that
+# each class is fully self-contained with no external dependencies.
+_HELPERS = (
+    "\t# ── wire-format helpers (inlined, no GDExtension) ──────────────────────\n"
+    "\tstatic func _encode_varint(_b: PackedByteArray, v: int) -> void:\n"
+    "\t\tvar val := v\n"
+    "\t\twhile val > 0x7F:\n"
+    "\t\t\t_b.append((val & 0x7F) | 0x80)\n"
+    "\t\t\tval >>= 7\n"
+    "\t\t_b.append(val & 0x7F)\n"
+    "\n"
+    "\tstatic func _encode_tag(_b: PackedByteArray, fnum: int, wt: int) -> void:\n"
+    "\t\t_encode_varint(_b, (fnum << 3) | wt)\n"
+    "\n"
+    "\tstatic func _encode_string(_b: PackedByteArray, fnum: int, v: String) -> void:\n"
+    "\t\tvar bytes: PackedByteArray = v.to_utf8_buffer()\n"
+    "\t\t_encode_tag(_b, fnum, 2)\n"
+    "\t\t_encode_varint(_b, bytes.size())\n"
+    "\t\t_b.append_array(bytes)\n"
+    "\n"
+    "\tstatic func _encode_bytes_f(_b: PackedByteArray, fnum: int, v: PackedByteArray) -> void:\n"
+    "\t\t_encode_tag(_b, fnum, 2)\n"
+    "\t\t_encode_varint(_b, v.size())\n"
+    "\t\t_b.append_array(v)\n"
+    "\n"
+    "\tstatic func _encode_varint_f(_b: PackedByteArray, fnum: int, v: int) -> void:\n"
+    "\t\t_encode_tag(_b, fnum, 0)\n"
+    "\t\t_encode_varint(_b, v)\n"
+    "\n"
+    "\tstatic func _encode_bool_f(_b: PackedByteArray, fnum: int, v: bool) -> void:\n"
+    "\t\t_encode_tag(_b, fnum, 0)\n"
+    "\t\t_encode_varint(_b, 1 if v else 0)\n"
+    "\n"
+    "\tstatic func _decode_varint(data: PackedByteArray, pos: int) -> Array:\n"
+    "\t\tvar value := 0\n"
+    "\t\tvar shift := 0\n"
+    "\t\tvar p := pos\n"
+    "\t\twhile p < data.size():\n"
+    "\t\t\tvar b: int = data[p]\n"
+    "\t\t\tp += 1\n"
+    "\t\t\tvalue |= (b & 0x7F) << shift\n"
+    "\t\t\tshift += 7\n"
+    "\t\t\tif (b & 0x80) == 0:\n"
+    "\t\t\t\tbreak\n"
+    "\t\treturn [value, p]\n"
+    "\n"
+    "\tstatic func _decode_bytes_raw(data: PackedByteArray, pos: int) -> Array:\n"
+    "\t\tvar lr := _decode_varint(data, pos)\n"
+    "\t\tvar length: int = lr[0]\n"
+    "\t\tvar p: int = lr[1]\n"
+    "\t\treturn [data.slice(p, p + length), p + length]\n"
+    "\n"
+    "\tstatic func _decode_string(data: PackedByteArray, pos: int) -> Array:\n"
+    "\t\tvar r := _decode_bytes_raw(data, pos)\n"
+    "\t\treturn [(r[0] as PackedByteArray).get_string_from_utf8(), r[1]]\n"
+    "\n"
+    "\tstatic func _skip_field(data: PackedByteArray, pos: int, wire_type: int) -> int:\n"
+    "\t\tmatch wire_type:\n"
+    "\t\t\t0:\n"
+    "\t\t\t\treturn _decode_varint(data, pos)[1]\n"
+    "\t\t\t1:\n"
+    "\t\t\t\treturn pos + 8\n"
+    "\t\t\t2:\n"
+    "\t\t\t\tvar lr := _decode_varint(data, pos)\n"
+    "\t\t\t\treturn lr[1] + lr[0]\n"
+    "\t\t\t5:\n"
+    "\t\t\t\treturn pos + 4\n"
+    "\t\t\t_:\n"
+    "\t\t\t\treturn data.size()"
+)
+
+
+def _gd_type(type_name: str, repeated: bool, kind: str = "scalar") -> str:
+    if repeated:
+        return "Array"
+    if kind == "enum":
+        return "int"  # proto enums are int32 on the wire
+    return _GD_TYPE.get(type_name, "Variant")
+
+
+def _gd_default(type_name: str, repeated: bool, kind: str = "scalar") -> str:
+    if repeated:
+        return "[]"
+    if kind == "enum":
+        return "0"  # proto enum default is always 0
+    gd = _GD_TYPE.get(type_name)
+    if gd is None:
+        return "null"
+    return _GD_DEFAULT.get(gd, "null")
+
+
+def _gen_to_bytes(msg: Message) -> List[str]:
+    lines = ["\tfunc to_bytes() -> PackedByteArray:"]
+    lines.append("\t\tvar _buf := PackedByteArray()")
+    for f in msg.fields:
+        fn, tn, n = f.number, f.type_name, f.name
+        # Enum fields are varint scalars on the wire (same as int32)
+        is_varint = (tn in _VARINT_TYPES) or (f.kind == "enum")
+        if f.repeated:
+            lines.append(f"\t\tfor _v in {n}:")
+            if tn == "string":
+                lines.append(f"\t\t\t_encode_string(_buf, {fn}, _v)")
+            elif tn == "bytes":
+                lines.append(f"\t\t\t_encode_bytes_f(_buf, {fn}, _v)")
+            elif is_varint:
+                lines.append(f"\t\t\t_encode_varint_f(_buf, {fn}, _v)")
+            elif tn == "bool":
+                lines.append(f"\t\t\t_encode_bool_f(_buf, {fn}, _v)")
+            else:
+                # nested message type
+                lines.append(f"\t\t\t_encode_bytes_f(_buf, {fn}, _v.to_bytes())")
+        else:
+            if tn == "string":
+                lines.append(f'\t\tif {n} != "":')
+                lines.append(f"\t\t\t_encode_string(_buf, {fn}, {n})")
+            elif tn == "bytes":
+                lines.append(f"\t\tif {n}.size() > 0:")
+                lines.append(f"\t\t\t_encode_bytes_f(_buf, {fn}, {n})")
+            elif is_varint:
+                lines.append(f"\t\tif {n} != 0:")
+                lines.append(f"\t\t\t_encode_varint_f(_buf, {fn}, {n})")
+            elif tn == "bool":
+                lines.append(f"\t\tif {n}:")
+                lines.append(f"\t\t\t_encode_bool_f(_buf, {fn}, {n})")
+            else:
+                # nested message type
+                lines.append(f"\t\tif {n} != null:")
+                lines.append(f"\t\t\t_encode_bytes_f(_buf, {fn}, {n}.to_bytes())")
+    lines.append("\t\treturn _buf")
+    return lines
+
+
+def _gen_from_bytes(msg: Message) -> List[str]:
+    lines = [f"\tstatic func from_bytes(data: PackedByteArray) -> {msg.name}:"]
+    lines.append(f"\t\tvar _msg := {msg.name}.new()")
+    lines.append("\t\tvar _pos := 0")
+    lines.append("\t\twhile _pos < data.size():")
+    lines.append("\t\t\tvar _tr := _decode_varint(data, _pos)")
+    lines.append("\t\t\t_pos = _tr[1]")
+    lines.append("\t\t\tvar _fnum := (_tr[0] as int) >> 3")
+    lines.append("\t\t\tvar _wt := (_tr[0] as int) & 0x7")
+    lines.append("\t\t\tmatch _fnum:")
+
+    for f in msg.fields:
+        fn, tn, n = f.number, f.type_name, f.name
+        lines.append(f"\t\t\t\t{fn}:")
+        if tn == "string":
+            lines.append(f"\t\t\t\t\tvar _r := _decode_string(data, _pos)")
+            if f.repeated:
+                lines.append(f"\t\t\t\t\t_msg.{n}.append(_r[0])")
+            else:
+                lines.append(f"\t\t\t\t\t_msg.{n} = _r[0]")
+            lines.append(f"\t\t\t\t\t_pos = _r[1]")
+        elif tn == "bytes":
+            lines.append(f"\t\t\t\t\tvar _r := _decode_bytes_raw(data, _pos)")
+            if f.repeated:
+                lines.append(f"\t\t\t\t\t_msg.{n}.append(_r[0])")
+            else:
+                lines.append(f"\t\t\t\t\t_msg.{n} = _r[0]")
+            lines.append(f"\t\t\t\t\t_pos = _r[1]")
+        elif (tn in _VARINT_TYPES) or (f.kind == "enum"):
+            # Enum fields are varint scalars on the wire (same as int32)
+            lines.append(f"\t\t\t\t\tvar _r := _decode_varint(data, _pos)")
+            if f.repeated:
+                lines.append(f"\t\t\t\t\t_msg.{n}.append(_r[0])")
+            else:
+                lines.append(f"\t\t\t\t\t_msg.{n} = _r[0]")
+            lines.append(f"\t\t\t\t\t_pos = _r[1]")
+        elif tn == "bool":
+            lines.append(f"\t\t\t\t\tvar _r := _decode_varint(data, _pos)")
+            if f.repeated:
+                lines.append(f"\t\t\t\t\t_msg.{n}.append(_r[0] != 0)")
+            else:
+                lines.append(f"\t\t\t\t\t_msg.{n} = _r[0] != 0")
+            lines.append(f"\t\t\t\t\t_pos = _r[1]")
+        else:
+            # nested message
+            lines.append(f"\t\t\t\t\tvar _r := _decode_bytes_raw(data, _pos)")
+            if f.repeated:
+                lines.append(f"\t\t\t\t\t_msg.{n}.append({tn}.from_bytes(_r[0]))")
+            else:
+                lines.append(f"\t\t\t\t\t_msg.{n} = {tn}.from_bytes(_r[0])")
+            lines.append(f"\t\t\t\t\t_pos = _r[1]")
+
+    lines.append("\t\t\t\t_:")
+    lines.append("\t\t\t\t\t_pos = _skip_field(data, _pos, _wt)")
+    lines.append("\t\treturn _msg")
+    return lines
+
+
+def _gen_enum_block(enum: Enum) -> List[str]:
+    lines = [f"enum {enum.name} {{"]
+    for v in enum.values:
+        lines.append(f"\t{v.name} = {v.number},")
+    lines.append("}")
+    return lines
+
+
+def _gen_message_class(msg: Message) -> List[str]:
+    lines = [f"class {msg.name}:"]
+    for f in msg.fields:
+        gdt = _gd_type(f.type_name, f.repeated, f.kind)
+        gdd = _gd_default(f.type_name, f.repeated, f.kind)
+        lines.append(f"\tvar {f.name}: {gdt} = {gdd}")
+    lines.append("")
+    lines.extend(_gen_to_bytes(msg))
+    lines.append("")
+    lines.extend(_gen_from_bytes(msg))
+    lines.append("")
+    lines.append(_HELPERS)
+    return lines
+
+
+def render_gdscript(proto: ProtoFile) -> str:
+    """Return complete GDScript file content for a ProtoFile."""
+    buf: List[str] = [
+        f"# Auto-generated from {proto.filename} by protoc-gen-gdscript",
+        "# DO NOT EDIT MANUALLY",
+        "# Godot 4 compatible -- no GDExtension required",
+        "",
+    ]
+    for enum in proto.enums:
+        buf.extend(_gen_enum_block(enum))
+        buf.append("")
+    for msg in proto.messages:
+        buf.extend(_gen_message_class(msg))
+        buf.append("")
+    return "\n".join(buf)
+
+
+def write_gdscript(proto: ProtoFile, out_dir: str) -> None:
+    """Write <proto.base_name>_pb.gd into out_dir."""
+    out_path = os.path.join(out_dir, f"{proto.base_name}_pb.gd")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(render_gdscript(proto))
+    print(f"  [gdscript] {out_path}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Standalone mode
+# ---------------------------------------------------------------------------
+
+def run_standalone(proto_path: str, gdscript_out: str) -> None:
+    proto_files = glob.glob(os.path.join(proto_path, "*.proto"))
+    if not proto_files:
+        print(f"error: no .proto files found in {proto_path!r}", file=sys.stderr)
+        sys.exit(1)
+    for pf in sorted(proto_files):
+        try:
+            write_gdscript(parse_proto_file(pf), gdscript_out)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Protoc plugin mode
+# ---------------------------------------------------------------------------
+
+def _write_plugin_error(msg: str) -> None:
+    """Write a minimal CodeGeneratorResponse with only the error field set."""
+    encoded = msg.encode("utf-8")
+    length = len(encoded)
+    varint_bytes = bytearray()
+    v = length
+    while v > 0x7F:
+        varint_bytes.append((v & 0x7F) | 0x80)
+        v >>= 7
+    varint_bytes.append(v & 0x7F)
+    # field 1 (error), wire type 2 → tag byte 0x0A
+    sys.stdout.buffer.write(bytes([0x0A]) + bytes(varint_bytes) + encoded)
+
+
+def _fd_kind(field_proto) -> str:
+    """Return 'scalar', 'enum', or 'message' for a FieldDescriptorProto."""
+    if field_proto.type == 11:  # TYPE_MESSAGE
+        return "message"
+    if field_proto.type == 14:  # TYPE_ENUM
+        return "enum"
+    return "scalar"
+
+
+def _fd_type_to_str(field_proto) -> str:
+    """Convert a FieldDescriptorProto.type int to a proto type name string."""
+    _TYPE_MAP = {
+        1: "double", 2: "float",
+        3: "int64",  4: "uint64",
+        5: "int32",  8: "bool",
+        9: "string", 11: "message",
+        12: "bytes", 13: "uint32",
+        14: "enum",  17: "sint32",
+        18: "sint64",
+    }
+    t = _TYPE_MAP.get(field_proto.type, "bytes")
+    if t in ("message", "enum"):
+        # type_name is ".package.TypeName" — take the last component
+        return field_proto.type_name.lstrip(".").split(".")[-1]
+    return t
+
+
+def _fd_to_proto_file(fd, fname: str) -> ProtoFile:
+    """Convert a google.protobuf FileDescriptorProto to our ProtoFile."""
+    proto = ProtoFile(fname)
+    proto.package = getattr(fd, "package", "") or ""
+    for msg_fd in fd.message_type:
+        msg = Message(msg_fd.name)
+        for fld in msg_fd.field:
+            type_name = _fd_type_to_str(fld)
+            kind = _fd_kind(fld)
+            repeated = (fld.label == 3)  # LABEL_REPEATED = 3
+            msg.fields.append(Field(type_name, fld.name, fld.number, repeated, kind))
+        proto.messages.append(msg)
+    for enum_fd in fd.enum_type:
+        enum = Enum(enum_fd.name)
+        for val in enum_fd.value:
+            enum.values.append(EnumValue(val.name, val.number))
+        proto.enums.append(enum)
+    return proto
+
+
+def run_plugin_mode() -> None:
+    """
+    Handle protoc plugin protocol:
+    read CodeGeneratorRequest from stdin, write CodeGeneratorResponse to stdout.
+    Requires: pip install protobuf
+    """
+    try:
+        from google.protobuf.compiler import plugin_pb2
+    except ImportError:
+        _write_plugin_error(
+            "protoc-gen-gdscript: google-protobuf Python package not installed.\n"
+            "Install with: pip install protobuf\n"
+            "Or use standalone mode:\n"
+            "  python3 protoc-gen-gdscript --proto_path=<dir> --gdscript_out=<dir>"
+        )
+        return
+
+    data = sys.stdin.buffer.read()
+    request = plugin_pb2.CodeGeneratorRequest()
+    request.ParseFromString(data)
+
+    response = plugin_pb2.CodeGeneratorResponse()
+    try:
+        response.supported_features = (
+            plugin_pb2.CodeGeneratorResponse.FEATURE_PROTO3_OPTIONAL
+        )
+    except AttributeError:
+        pass  # older google-protobuf versions may not have this constant
+
+    file_map = {fd.name: fd for fd in request.proto_file}
+    for fname in request.file_to_generate:
+        fd = file_map.get(fname)
+        if fd is None:
+            response.error = f"missing FileDescriptorProto for {fname}"
+            break
+        proto = _fd_to_proto_file(fd, fname)
+        out_file = response.file.add()
+        out_file.name = f"{proto.base_name}_pb.gd"
+        out_file.content = render_gdscript(proto)
+
+    sys.stdout.buffer.write(response.SerializeToString())
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _print_help() -> None:
+    print(__doc__)
+    print("Options:")
+    print("  --proto_path=DIR    Directory containing .proto source files")
+    print("  --gdscript_out=DIR  Output directory for generated *_pb.gd files")
+    print("  --help, -h          Show this help message")
+    print()
+    print("Examples:")
+    print("  # Standalone")
+    print("  python3 protoc-gen-gdscript --proto_path=GameServer/proto \\")
+    print("                              --gdscript_out=Engine/godot/project/proto/gen")
+    print()
+    print("  # Via protoc (plugin mode)")
+    print("  protoc --plugin=protoc-gen-gdscript=Tools/protoc/gen-gdscript/protoc-gen-gdscript \\")
+    print("         --gdscript_out=Engine/godot/project/proto/gen \\")
+    print("         GameServer/proto/*.proto")
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+
+    if "--help" in argv or "-h" in argv:
+        _print_help()
+        sys.exit(0)
+
+    if not argv:
+        # No arguments: detect plugin mode from stdin
+        if not sys.stdin.isatty():
+            run_plugin_mode()
+        else:
+            _print_help()
+            sys.exit(0)
+        return
+
+    # Standalone mode
+    parser = argparse.ArgumentParser(
+        prog="protoc-gen-gdscript",
+        description="Generate GDScript proto classes from .proto files.",
+        add_help=False,
+    )
+    parser.add_argument("--proto_path", required=True,
+                        help="Directory containing .proto source files")
+    parser.add_argument("--gdscript_out", required=True,
+                        help="Output directory for generated *_pb.gd files")
+    args, _unknown = parser.parse_known_args(argv)
+    run_standalone(args.proto_path, args.gdscript_out)
+
+
+if __name__ == "__main__":
+    main()

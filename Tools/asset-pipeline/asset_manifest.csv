@@ -1,0 +1,4 @@
+name,description,type,category,subcategory,tags,style,source,prompt
+Wooden Crate,A simple wooden storage crate,3d_model,prop,container,"wooden,crate,container",cartoon_lowpoly,tripo,"low poly cartoon wooden crate, clean geometry, warm colors"
+Green Slime,A bouncy green slime enemy,2d_sprite,character,enemy,"slime,enemy,green",cartoon_lowpoly,sdxl,"cartoon green slime character, transparent background, game sprite"
+Coin Pickup,Golden coin sound effect,audio_sfx,sfx,pickup,"coin,pickup,reward",,elevenlabs,"coin pickup chime, 8-bit style, short"

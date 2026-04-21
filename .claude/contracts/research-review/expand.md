@@ -1,0 +1,2 @@
+- {RESEARCH_DIR}/research-result/*.md — 仅复杂调研有子文件时读取
+- 补充搜索验证 — 仅对重大疑点启动

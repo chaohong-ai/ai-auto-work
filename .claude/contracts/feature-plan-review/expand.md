@@ -1,0 +1,2 @@
+- {FEATURE_DIR}/plan/*.md — 仅当审查命中对应模块时读取
+- 上轮 review 报告 — 仅修复轮用于追踪 [RECURRING]

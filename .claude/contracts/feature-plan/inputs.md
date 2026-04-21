@@ -1,0 +1,2 @@
+- {FEATURE_DIR}/feature.md（或 feature.json）— 需求文档
+- 宪法已自动加载，不需要再读

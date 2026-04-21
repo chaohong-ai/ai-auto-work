@@ -1,0 +1,12 @@
+读取 .claude/commands/feature/plan-creator.auto.md 中的工作流程并执行。
+
+上下文最小化要求：
+- 先判定本次 feature 命中的模块，再决定读取哪些文档和代码
+- 默认只读 feature.md + .ai/constitution.md + 命中模块的架构/代码
+- 未命中的模块（例如纯 Backend 任务中的 MCP / Engine / Godot）禁止预读
+- 只有规则不明确时才补读 .claude/constitution.md 或专题 guide
+
+参数（已解析，直接使用）：
+- version_id: v0.0.3
+- feature_name: maker-container
+- FEATURE_DIR: Docs/Version/v0.0.3/maker-container

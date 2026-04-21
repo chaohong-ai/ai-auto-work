@@ -1,0 +1,173 @@
+version: "3.8"
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: gamemaker-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: gamemaker
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: gamemaker-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: gamemaker-milvus-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - etcd-data:/etcd
+    networks:
+      - gamemaker-net
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: gamemaker-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+    volumes:
+      - minio-data:/minio_data
+    networks:
+      - gamemaker-net
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: gamemaker-milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Go API Server
+  server:
+    build:
+      context: ../../Backend
+      dockerfile: Dockerfile
+    container_name: gamemaker-server
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_MODE: debug
+      SERVER_PORT: "8080"
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DATABASE: gamemaker
+      REDIS_ADDR: redis:6379
+      MILVUS_ADDR: milvus:19530
+      MCP_ADDR: mcp:3000
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MCP Server (TypeScript Express + TCP bridge to Godot)
+  mcp:
+    build:
+      context: ../../MCP
+      dockerfile: Dockerfile
+    container_name: gamemaker-mcp
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      GODOT_HOST: godot-headless
+      GODOT_PORT: "6007"
+    depends_on:
+      godot-headless:
+        condition: service_healthy
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Godot Headless container (test env, managed by Server in production)
+  godot-headless:
+    build:
+      context: ../../Engine/docker
+      dockerfile: Dockerfile
+    container_name: gamemaker-godot
+    ports:
+      - "6007:6007"  # TCP for MCP JSON-RPC
+    volumes:
+      - godot-projects:/home/godot/projects
+    environment:
+      GODOT_MODE: idle
+    networks:
+      - gamemaker-net
+    healthcheck:
+      test: ["CMD", "bash", "/home/godot/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  gamemaker-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
+  redis-data:
+  etcd-data:
+  minio-data:
+  milvus-data:
+  godot-projects:

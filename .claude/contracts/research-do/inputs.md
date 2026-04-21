@@ -1,0 +1,2 @@
+- {RESEARCH_DIR}/idea.md — 调研需求（如存在）
+- 宪法已自动加载

@@ -1,0 +1,2346 @@
+#!/bin/bash
+# auto-work-loop.sh
+# 全自动工作流：需求 → feature.md → plan.md → 任务拆分 → 逐任务开发+提交
+# 串联 feature-plan-loop.sh 和 feature-develop-loop.sh，一键完成从需求到代码
+# 每个任务独立开发、验证、提交，确保增量可回溯
+#
+# 用法: bash .claude/scripts/auto-work-loop.sh <version_id> <feature_name> [requirement]
+# 示例:
+#   bash .claude/scripts/auto-work-loop.sh v0.0.3 asset-search                    # 从 idea.md 读取需求
+#   bash .claude/scripts/auto-work-loop.sh v0.0.3 asset-search "额外补充需求"      # idea.md + 补充
+#   bash .claude/scripts/auto-work-loop.sh v0.0.3 asset-search "完整需求描述"      # 无 idea.md 时
+#
+# 前置条件:
+#   - claude CLI 可用
+#   - 从项目根目录运行
+
+set -euo pipefail
+
+# 共享 review 调度逻辑
+source "$(dirname "$0")/review-helpers.sh"
+
+# CLI trace：统一 cli_call / codex_review_exec 定义（含 JSONL trace 落盘）
+source "$(dirname "$0")/cli-trace-helpers.sh"
+
+# ══════════════════════════════════════
+# 参数解析
+# ══════════════════════════════════════
+
+VERSION_ID="${1:?用法: $0 <version_id> <feature_name> [requirement]}"
+FEATURE_NAME="${2:?用法: $0 <version_id> <feature_name> [requirement]}"
+USER_REQUIREMENT="${3:-}"
+# TODO: 未来可支持 --complexity=X 覆盖 AI 判定
+
+FEATURE_DIR="Docs/Version/${VERSION_ID}/${FEATURE_NAME}"
+WORK_LOG="${FEATURE_DIR}/auto-work-log.md"
+IDEA_FILE="${FEATURE_DIR}/idea.md"
+
+# 创建目录
+mkdir -p "$FEATURE_DIR"
+
+# trace 上下文：让 Bash trace helper 知道 trace 写到哪里
+export AUTO_WORK_FEATURE_DIR="$FEATURE_DIR"
+
+# ══════════════════════════════════════
+# 辅助函数
+# ══════════════════════════════════════
+
+# 将秒数格式化为 Xm Ys
+format_duration() {
+    local secs=$1
+    local mins=$((secs / 60))
+    local remaining_secs=$((secs % 60))
+    if [ "$mins" -gt 0 ]; then
+        echo "${mins}m ${remaining_secs}s"
+    else
+        echo "${remaining_secs}s"
+    fi
+}
+
+# 记录复杂度升级事件到日志和 classification.txt
+record_upgrade() {
+    local from="$1"
+    local to="$2"
+    echo "| 升级 | ${from}→${to} | $(date '+%H:%M:%S') | - | 开发失败，自动升级 |" >> "$WORK_LOG"
+    echo "complexity=${to}" >> "$CLASSIFY_FILE"
+    echo "upgraded_from=${from}" >> "$CLASSIFY_FILE"
+    UPGRADED_FROM="${from}"
+}
+
+# 模型选择：支持按阶段使用不同模型
+#
+# 环境变量（优先级从高到低）：
+#   CLAUDE_MODEL_LIGHT  — 调研/分类/plan/文档等轻量阶段（省 token）
+#   CLAUDE_MODEL_CODE   — 编码/开发/修复等重度阶段（编码能力强）
+#   CLAUDE_MODEL        — 全局兜底（不区分阶段时使用，向后兼容）
+#
+# 用法:
+#   CLAUDE_MODEL_LIGHT=sonnet CLAUDE_MODEL_CODE=opus bash .claude/scripts/auto-work-loop.sh ...
+#   CLAUDE_MODEL=sonnet bash .claude/scripts/auto-work-loop.sh ...  # 向后兼容，全程同一模型
+CLAUDE_MODEL="${CLAUDE_MODEL:-}"
+CLAUDE_MODEL_LIGHT="${CLAUDE_MODEL_LIGHT:-$CLAUDE_MODEL}"
+CLAUDE_MODEL_CODE="${CLAUDE_MODEL_CODE:-$CLAUDE_MODEL}"
+
+CLAUDE_MODEL_FLAG=""
+
+# 切换到轻量模型（调研/分类/plan/文档/验收）
+use_model_light() {
+    if [ -n "$CLAUDE_MODEL_LIGHT" ]; then
+        CLAUDE_MODEL_FLAG="--model $CLAUDE_MODEL_LIGHT"
+        export CLAUDE_MODEL="$CLAUDE_MODEL_LIGHT"
+    else
+        CLAUDE_MODEL_FLAG=""
+        export CLAUDE_MODEL=""
+    fi
+}
+
+# 切换到编码模型（开发/修复/补救）
+use_model_code() {
+    if [ -n "$CLAUDE_MODEL_CODE" ]; then
+        CLAUDE_MODEL_FLAG="--model $CLAUDE_MODEL_CODE"
+        export CLAUDE_MODEL="$CLAUDE_MODEL_CODE"
+    else
+        CLAUDE_MODEL_FLAG=""
+        export CLAUDE_MODEL=""
+    fi
+}
+
+# 初始：轻量模型（阶段零从分类开始）
+use_model_light
+
+if [ -n "$CLAUDE_MODEL_LIGHT" ] && [ -n "$CLAUDE_MODEL_CODE" ] && [ "$CLAUDE_MODEL_LIGHT" != "$CLAUDE_MODEL_CODE" ]; then
+    echo "模型策略: 调研/plan=${CLAUDE_MODEL_LIGHT}, 编码/开发=${CLAUDE_MODEL_CODE}"
+elif [ -n "$CLAUDE_MODEL" ]; then
+    echo "使用模型: ${CLAUDE_MODEL}（全程统一）"
+fi
+
+CODEX_MODEL="${CODEX_MODEL:-}"
+CODEX_MODEL_FLAG=""
+if [ -n "$CODEX_MODEL" ]; then
+    CODEX_MODEL_FLAG="-m $CODEX_MODEL"
+    echo "使用 Codex 审查模型: ${CODEX_MODEL}"
+fi
+
+# cli_call / codex_review_exec 由 cli-trace-helpers.sh 提供（含 trace 落盘）
+
+run_parallel_acceptance_reviews() {
+    local base_prompt="$1"
+    local merged_file="$2"
+    local tmp_dir
+    tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t codex-acceptance)
+
+    local p1="${tmp_dir}/req_impl.md"
+    local p2="${tmp_dir}/test_config.md"
+    local p3="${tmp_dir}/risk.md"
+
+    codex_review_exec "${base_prompt}
+
+【验收分片】
+你只负责：需求实现完整性、REQ 映射、功能遗漏。" > "$p1" 2>&1 &
+    local pid1=$!
+
+    codex_review_exec "${base_prompt}
+
+【验收分片】
+你只负责：配置完整性、测试覆盖、router/hurl/compile gate。" > "$p2" 2>&1 &
+    local pid2=$!
+
+    codex_review_exec "${base_prompt}
+
+【验收分片】
+你只负责：边界条件、回归风险、上线阻断项、Context Repairs。" > "$p3" 2>&1 &
+    local pid3=$!
+
+    wait "$pid1" || true
+    wait "$pid2" || true
+    wait "$pid3" || true
+
+    local merge_prompt
+    merge_prompt="你是一名验收报告汇总者。请读取以下 3 份 Codex 分片验收结果，合并成一份正式验收报告并写入 ${merged_file}。
+
+输入文件：
+1. ${p1}
+2. ${p2}
+3. ${p3}
+
+规则：
+1. 逐条汇总 REQ 的 PASS/FAIL/SKIP 结论
+2. 去重，失败原因按最阻断上线的版本保留
+3. 必须包含 ## Context Repairs；如果无则写 - 无
+4. 报告最后一行必须输出：ALL_REQ_ACCEPTED / REMEDIATION_NEEDED: ... / CANNOT_VERIFY / FINAL_FAIL: ...
+5. 直接写文件，不要提问"
+
+    cli_call "$merge_prompt" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+    rm -rf "$tmp_dir"
+}
+
+run_single_acceptance_review() {
+    local prompt="$1"
+    local output_file="$2"
+    codex_review_exec "$prompt" > "$output_file" 2>&1
+}
+
+generate_acceptance_review_input() {
+    local output_file="${FEATURE_DIR}/review-input-acceptance.md"
+    local base_ref="${1:-HEAD~10}"
+
+    {
+        echo "# Acceptance Review Input (auto-generated)"
+        echo ""
+        echo "## REQ List"
+        if [ -f "${FEATURE_DIR}/feature.md" ]; then
+            grep -E 'REQ-[0-9]+|^###? .*(P[012])' "${FEATURE_DIR}/feature.md" 2>/dev/null || echo "(no REQs found)"
+        elif [ -f "${FEATURE_DIR}/feature.json" ]; then
+            grep -E 'REQ-[0-9]+' "${FEATURE_DIR}/feature.json" 2>/dev/null || echo "(no REQs found)"
+        fi
+        echo ""
+        echo "## Completed Tasks"
+        if [ -d "${TASKS_DIR:-${FEATURE_DIR}/tasks}" ]; then
+            for tf in "${TASKS_DIR:-${FEATURE_DIR}/tasks}"/task-*.md; do
+                [ -f "$tf" ] || continue
+                local tstatus
+                tstatus=$(grep -E "^status:" "$tf" 2>/dev/null | head -1 || echo "unknown")
+                echo "- $(basename "$tf"): ${tstatus}"
+            done
+        else
+            echo "- (no tasks directory)"
+        fi
+        echo ""
+        echo "## Git Diff --stat"
+        git diff --stat "$base_ref"..HEAD 2>/dev/null || echo "(no diff available)"
+        echo ""
+        echo "## Compile/Test Status"
+        echo "Tasks completed: ${COMPLETED_TASKS:-unknown} | Tasks failed: ${FAILED_TASKS:-unknown}"
+        # 快速编译检查获取当前实际状态
+        if [ -d "Backend" ]; then
+            if (cd Backend && go build ./... >/dev/null 2>&1); then
+                echo "Go compile: OK"
+            else
+                echo "Go compile: FAIL"
+            fi
+        fi
+        if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
+            if (cd MCP && npx tsc --noEmit >/dev/null 2>&1); then
+                echo "TS MCP compile: OK"
+            else
+                echo "TS MCP compile: FAIL"
+            fi
+        fi
+        if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ]; then
+            if (cd Frontend && npx tsc --noEmit >/dev/null 2>&1); then
+                echo "TS Frontend compile: OK"
+            else
+                echo "TS Frontend compile: FAIL"
+            fi
+        fi
+    } > "$output_file"
+    echo "$output_file"
+}
+
+apply_context_repairs() {
+    local review_file="$1"
+    local feature_dir="$2"
+
+    # cheap gate: 使用共享函数检查是否有实质内容
+    if ! context_repair_cheap_gate "$review_file"; then
+        echo "  [Context Repair] 跳过（无实质 repair 内容）"
+        return 0
+    fi
+
+    echo "  [Context Repair] 检测到上下文缺口，开始补齐共享/运行时文档..."
+
+    local repair_prompt
+    repair_prompt="你是一名负责知识沉淀的工程师。请读取 review 报告中的“## Context Repairs”段，并把其中需要长期固化的内容落实到仓库文档。
+
+输入文件：
+1. ${review_file}
+2. .ai/README.md
+3. .ai/context/project.md
+4. .ai/constitution.md
+5. .claude/commands/auto-work.md
+6. .claude/rules/context-repair.md（如存在）
+7. 必要时读取相关 .claude/skills/ 和 .claude/commands/
+
+执行规则：
+1. 先判断每条缺口应落到 .ai/ 还是 .claude/
+2. 只补充可长期复用的规则、术语、约束和工作约定
+3. 不重复已有内容；如果已有规则不够明确，就增强原文
+4. 修改完成后，在 ${feature_dir}/context-repair-log.md 追加记录：更新了哪些文件、解决了什么上下文缺口
+5. 不向用户提问，直接完成"
+
+    cli_call "$repair_prompt" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+}
+
+check_feature_pending_items() {
+    local feature_file="${FEATURE_DIR}/feature.md"
+    local response_file="${FEATURE_DIR}/pending-items-response.md"
+
+    # 已有用户回复，跳过
+    if [ -f "$response_file" ]; then
+        echo "待确认项已有用户回复记录，跳过确认"
+        return 0
+    fi
+
+    # 提取 ## 备注 章节中标注 [待确认] 的行
+    local pending_items
+    pending_items=$(awk '/^## 备注/{f=1} f && /\[待确认\]/{print}' "$feature_file" 2>/dev/null)
+
+    if [ -z "$pending_items" ]; then
+        echo "feature.md 无待确认项，继续执行"
+        return 0
+    fi
+
+    echo ""
+    echo "════════════════════════════════════════"
+    echo "  feature.md 中有待确认项，请确认后继续："
+    echo "════════════════════════════════════════"
+    echo "$pending_items"
+    echo ""
+    echo "请输入您的答复（直接按回车跳过，使用默认方案）："
+    read -r USER_PENDING_RESPONSE
+
+    {
+        echo "# 待确认项用户答复"
+        echo ""
+        echo "## 待确认项"
+        echo "$pending_items"
+        echo ""
+        echo "## 用户答复"
+        if [ -n "$USER_PENDING_RESPONSE" ]; then
+            echo "$USER_PENDING_RESPONSE"
+        else
+            echo "(用户跳过，使用默认方案)"
+        fi
+    } > "$response_file"
+
+    if [ -n "$USER_PENDING_RESPONSE" ]; then
+        echo "已记录答复，更新 feature.md 中的待确认项..."
+        local update_prompt="读取 ${FEATURE_DIR}/feature.md 和 ${FEATURE_DIR}/pending-items-response.md。
+将 ## 备注 章节中标注为 [待确认] 的条目，根据用户答复更新为具体决策（把 [待确认] 替换为 [已确认: 具体内容]）。
+保持文件其余内容不变，直接写文件，不要提问。"
+        cli_call "$update_prompt" --permission-mode bypassPermissions 2>&1 | tail -10
+        echo "feature.md 待确认项已更新"
+    fi
+
+    echo "| 待确认项确认 | 完成 | - | - | - | 1 | 用户$([ -n "$USER_PENDING_RESPONSE" ] && echo '提供了答复' || echo '选择跳过') |" >> "$WORK_LOG"
+}
+
+# ══════════════════════════════════════
+# 全局计数器与耗时变量
+# ══════════════════════════════════════
+
+CLI_CALL_COUNT=0
+UPGRADE_COUNT=0
+UPGRADED_FROM=""
+MAX_UPGRADE_CHAIN=1
+CLASSIFY_DURATION=0
+PLAN_DURATION=0
+DEV_DURATION=0
+GUARDIAN_DURATION=0
+DOC_DURATION=0
+PUSH_DURATION=0
+
+# ══════════════════════════════════════
+# 合并需求来源：idea.md + 用户输入
+# ══════════════════════════════════════
+
+REQUIREMENT=""
+
+if [ -f "$IDEA_FILE" ]; then
+    IDEA_CONTENT=$(cat "$IDEA_FILE")
+    echo "读取到 idea.md: ${IDEA_FILE}"
+    REQUIREMENT="$IDEA_CONTENT"
+fi
+
+if [ -n "$USER_REQUIREMENT" ]; then
+    if [ -n "$REQUIREMENT" ]; then
+        # 两者都有：idea.md 为基础，用户输入为补充
+        REQUIREMENT="${REQUIREMENT}
+
+---
+补充需求：${USER_REQUIREMENT}"
+        echo "合并用户补充需求"
+    else
+        # 仅有用户输入
+        REQUIREMENT="$USER_REQUIREMENT"
+    fi
+fi
+
+if [ -z "$REQUIREMENT" ]; then
+    echo "ERROR: 未找到 ${IDEA_FILE} 且未提供需求描述"
+    echo "请创建 ${IDEA_FILE} 或传入第三个参数"
+    exit 1
+fi
+
+echo "══════════════════════════════════════"
+echo "  Auto-Work 全自动流程"
+echo "  版本: ${VERSION_ID}"
+echo "  功能: ${FEATURE_NAME}"
+echo "  需求来源: $([ -f "$IDEA_FILE" ] && echo 'idea.md' || echo '')$([ -f "$IDEA_FILE" ] && [ -n "$USER_REQUIREMENT" ] && echo ' + ' || echo '')$([ -n "$USER_REQUIREMENT" ] && echo '用户输入' || echo '')"
+echo "══════════════════════════════════════"
+
+# 运行时前置检查（preflight_check 由 cli-trace-helpers.sh 提供）
+# 当 LIGHT 和 CODE 是不同模型时，两套参数面都要验证
+__preflight_fail_exit() {
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  PREFLIGHT 失败: ${PREFLIGHT_FAIL} (模型: ${CLAUDE_MODEL:-default})"
+    echo "══════════════════════════════════════"
+    echo ""
+    echo "auto-work 需要在当前 shell 环境中直接 spawn claude/codex 子进程。"
+    echo "当前环境不满足条件，建议："
+    echo ""
+    echo "  1. 在正常的 PowerShell/终端中手动运行:"
+    echo "     bash .claude/scripts/auto-work-loop.sh ${VERSION_ID} ${FEATURE_NAME} \"${USER_REQUIREMENT}\""
+    echo ""
+    echo "  2. 或降级到 manual-work（在 Claude Code 交互会话内执行，不依赖子进程）:"
+    echo "     /manual-work ${VERSION_ID} ${FEATURE_NAME}"
+    echo ""
+    exit 1
+}
+
+# 验证 LIGHT 模型（当前态）
+if ! preflight_check --require-codex; then
+    __preflight_fail_exit
+fi
+
+# 如果 CODE 模型不同于 LIGHT，额外验证 CODE 参数面
+if [ -n "$CLAUDE_MODEL_CODE" ] && [ "$CLAUDE_MODEL_CODE" != "$CLAUDE_MODEL_LIGHT" ]; then
+    echo "PREFLIGHT: 额外验证 CODE 模型 (${CLAUDE_MODEL_CODE})..."
+    __PREFLIGHT_PASSED=0  # 重置，允许再次检查
+    use_model_code
+    if ! preflight_check; then
+        __preflight_fail_exit
+    fi
+    use_model_light  # 切回 LIGHT，继续正常流程
+fi
+
+# ══════════════════════════════════════
+# 初始化总日志
+# ══════════════════════════════════════
+
+IDEA_EXISTS="否"
+[ -f "$IDEA_FILE" ] && IDEA_EXISTS="是"
+
+cat > "$WORK_LOG" << EOF
+# Auto-Work 全流程日志
+
+- **版本**: ${VERSION_ID}
+- **功能**: ${FEATURE_NAME}
+- **复杂度**: (待分类)
+- **通道**: (待分类)
+- **idea.md**: ${IDEA_EXISTS}
+- **补充需求**: ${USER_REQUIREMENT:-无}
+- **启动时间**: $(date '+%Y-%m-%d %H:%M:%S')
+
+| 阶段 | 状态 | 开始时间 | 结束时间 | 耗时 | CLI调用数 | 备注 |
+|------|------|----------|----------|------|-----------|------|
+EOF
+
+# ══════════════════════════════════════
+# 阶段零：需求分类（判断是否需要调研）
+# ══════════════════════════════════════
+
+STAGE0_START=$(date +%s)
+STAGE0_START_FMT=$(date '+%H:%M:%S')
+mark_stage "classify"
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段零：需求分类"
+echo "══════════════════════════════════════"
+
+CLASSIFY_FILE="${FEATURE_DIR}/classification.txt"
+
+if [ -f "$CLASSIFY_FILE" ]; then
+    WORK_TYPE=$(head -1 "$CLASSIFY_FILE" | tr -d '[:space:]' | sed 's/^type=//')
+    COMPLEXITY=$(grep '^complexity=' "$CLASSIFY_FILE" 2>/dev/null | head -1 | sed 's/^complexity=//' | tr -d '[:space:]' || true)
+    # 向后兼容：无 complexity 行或无效值默认为 L
+    if [ "$COMPLEXITY" != "S" ] && [ "$COMPLEXITY" != "M" ] && [ "$COMPLEXITY" != "L" ]; then
+        COMPLEXITY="L"
+    fi
+    echo "分类结果已存在: type=${WORK_TYPE}, complexity=${COMPLEXITY}，跳过分类"
+    echo "| 需求分类 | 跳过（已存在） | ${STAGE0_START_FMT} | ${STAGE0_START_FMT} | 0s | 0 | type=${WORK_TYPE} complexity=${COMPLEXITY} |" >> "$WORK_LOG"
+else
+    CLASSIFY_PROMPT="你是一名资深全栈开发工程师。请分析以下需求，判断它属于哪种工作类型。
+
+需求内容：
+${REQUIREMENT}
+
+请搜索项目中相关代码，然后判断这个需求属于以下哪种类型：
+
+**research（需要调研）**— 满足以下任一条件：
+- 全新的系统/功能设计，项目中没有类似实现可参考
+- 需要对比多种技术方案才能做决策
+- 涉及不熟悉的第三方库/平台能力，需要先调查可行性
+- 需求描述模糊，需要发散探索才能明确技术路线
+
+**direct（直接开发）**— 满足以下任一条件：
+- 在已有系统上修复 Bug
+- 在已有系统上优化性能或重构
+- 扩展已有功能
+- 需求明确且项目中有高度相似的实现可参考
+
+判断规则：
+1. 搜索项目代码，看是否已有相似系统可以参考
+2. 如果需求涉及的所有技术点在项目中都有成熟模式，判定为 direct
+3. 如果需求的核心技术路线不明确、或者需要在多个方案间做选型，判定为 research
+4. 偏向 direct — 只有真正需要发散调研时才判定为 research
+
+**复杂度判定（S/M/L 三级）：**
+在判断完 type 之后，还需要评估需求的实现复杂度：
+
+- **S（小型）**：单文件修改，或少量配置变更，预计 1-2 个函数改动
+- **M（中型）**：涉及 2-5 个文件，有一定逻辑复杂度但模式清晰
+- **L（大型）**：涉及 5+ 个文件或多个模块联动，需要仔细设计
+
+**严格按以下两行格式输出，不要输出其他任何内容：**
+type=research 或 type=direct
+complexity=S 或 complexity=M 或 complexity=L"
+
+    CLASSIFY_OUTPUT=$(cli_call "$CLASSIFY_PROMPT" --permission-mode bypassPermissions 2>&1)
+
+    # 从输出中提取 type 和 complexity
+    WORK_TYPE=$(echo "$CLASSIFY_OUTPUT" | grep -oE '(research|direct)' | tail -1)
+    COMPLEXITY=$(echo "$CLASSIFY_OUTPUT" | grep -oE 'complexity=(S|M|L)' | tail -1 | sed 's/^complexity=//')
+
+    # 默认为 direct（如果分类失败）
+    if [ "$WORK_TYPE" != "research" ] && [ "$WORK_TYPE" != "direct" ]; then
+        echo "WARNING: 分类结果异常 ('${WORK_TYPE}')，默认为 direct"
+        WORK_TYPE="direct"
+    fi
+
+    # 向后兼容：无 complexity 或无效值默认为 L
+    if [ "$COMPLEXITY" != "S" ] && [ "$COMPLEXITY" != "M" ] && [ "$COMPLEXITY" != "L" ]; then
+        COMPLEXITY="L"
+    fi
+
+    echo "type=${WORK_TYPE}" > "$CLASSIFY_FILE"
+    echo "complexity=${COMPLEXITY}" >> "$CLASSIFY_FILE"
+
+    STAGE0_END=$(date +%s)
+    STAGE0_END_FMT=$(date '+%H:%M:%S')
+    STAGE0_DURATION=$((STAGE0_END - STAGE0_START))
+    CLASSIFY_DURATION=$STAGE0_DURATION
+    echo "| 需求分类 | 完成 | ${STAGE0_START_FMT} | ${STAGE0_END_FMT} | ${STAGE0_DURATION}s | ${CLI_CALL_COUNT} | type=${WORK_TYPE} complexity=${COMPLEXITY} |" >> "$WORK_LOG"
+    echo "需求分类: type=${WORK_TYPE}, complexity=${COMPLEXITY} (${STAGE0_DURATION}s)"
+fi
+
+# 导出 COMPLEXITY 供子脚本（feature-plan-loop.sh, feature-develop-loop.sh）使用
+export COMPLEXITY
+
+# 更新日志头部的复杂度和通道字段
+case "$COMPLEXITY" in
+    S) CHANNEL_NAME="Fast Track" ;;
+    M) CHANNEL_NAME="Standard Track" ;;
+    L) CHANNEL_NAME="Full Track" ;;
+    *) CHANNEL_NAME="Unknown" ;;
+esac
+sed -i "s/\*\*复杂度\*\*: (待分类)/**复杂度**: ${COMPLEXITY}/" "$WORK_LOG"
+sed -i "s/\*\*通道\*\*: (待分类)/**通道**: ${CHANNEL_NAME}/" "$WORK_LOG"
+# M/L 级迭代上限参数
+case "$COMPLEXITY" in
+    M) PLAN_MAX_ROUNDS=1; DEV_MAX_ROUNDS=10 ;;
+    L) PLAN_MAX_ROUNDS=10; DEV_MAX_ROUNDS=15 ;;
+esac
+
+# ══════════════════════════════════════
+# 阶段零-B：调研（仅 research 类型执行）
+# ══════════════════════════════════════
+
+if [ "$WORK_TYPE" = "research" ]; then
+    STAGE0B_START=$(date +%s)
+    STAGE0B_START_FMT=$(date '+%H:%M:%S')
+    mark_stage "research"
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  阶段零-B：技术调研"
+    echo "══════════════════════════════════════"
+
+    RESEARCH_DIR="Docs/Research/${FEATURE_NAME}"
+    RESEARCH_RESULT="${RESEARCH_DIR}/research-result.md"
+
+    if [ -f "$RESEARCH_RESULT" ]; then
+        echo "调研报告已存在，跳过调研"
+        echo "| 技术调研 | 跳过（已存在） | ${STAGE0B_START_FMT} | ${STAGE0B_START_FMT} | 0s | 0 | - |" >> "$WORK_LOG"
+    else
+        # 将需求写入 idea.md 供调研使用
+        mkdir -p "$RESEARCH_DIR"
+        if [ ! -f "${RESEARCH_DIR}/idea.md" ]; then
+            echo "$REQUIREMENT" > "${RESEARCH_DIR}/idea.md"
+        fi
+
+        if [ "$COMPLEXITY" = "S" ]; then
+            # S 级调研：单次 cli_call，不调用 research-loop.sh
+            S_RESEARCH_PROMPT="请对以下需求进行快速技术调研，将结论写入 ${RESEARCH_RESULT}。
+
+需求：
+${REQUIREMENT}
+
+规则：
+1. 搜索项目代码了解现有实现
+2. 快速判断可行性和实现路径
+3. 将调研结论写入 ${RESEARCH_RESULT}
+4. 不需要多轮迭代，一次输出即可
+5. 直接写文件，不要向用户提问"
+
+            RESEARCH_EXIT=0
+            cli_call "$S_RESEARCH_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || RESEARCH_EXIT=$?
+
+            # 检查调研结果是否充分（文件存在且非空）
+            if [ ! -s "$RESEARCH_RESULT" ]; then
+                echo "WARNING: S 级调研结果不充分，标记需升级"
+                S_RESEARCH_INSUFFICIENT=true
+            fi
+        else
+            RESEARCH_EXIT=0
+            bash .claude/scripts/research-loop.sh "$FEATURE_NAME" 6 || RESEARCH_EXIT=$?
+        fi
+
+        STAGE0B_END=$(date +%s)
+        STAGE0B_END_FMT=$(date '+%H:%M:%S')
+        STAGE0B_DURATION=$((STAGE0B_END - STAGE0B_START))
+        CLASSIFY_DURATION=$((CLASSIFY_DURATION + STAGE0B_DURATION))
+
+        if [ $RESEARCH_EXIT -ne 0 ]; then
+            echo "WARNING: 调研阶段异常 (exit=$RESEARCH_EXIT)，继续后续流程"
+            echo "| 技术调研 | 异常 | ${STAGE0B_START_FMT} | ${STAGE0B_END_FMT} | ${STAGE0B_DURATION}s | ${CLI_CALL_COUNT} | exit=$RESEARCH_EXIT |" >> "$WORK_LOG"
+        else
+            echo "| 技术调研 | 完成 | ${STAGE0B_START_FMT} | ${STAGE0B_END_FMT} | ${STAGE0B_DURATION}s | ${CLI_CALL_COUNT} | ${RESEARCH_RESULT} |" >> "$WORK_LOG"
+            echo "技术调研完成 (${STAGE0B_DURATION}s)"
+
+            # 将调研结论追加到需求中，供后续阶段使用
+            if [ -f "$RESEARCH_RESULT" ]; then
+                REQUIREMENT="${REQUIREMENT}
+
+---
+技术调研结论（参考 ${RESEARCH_RESULT}）：
+$(head -100 "$RESEARCH_RESULT")"
+            fi
+        fi
+    fi
+else
+    echo ""
+    echo "需求类型为 direct，跳过调研阶段"
+    echo "| 技术调研 | 跳过（direct 类型） | - | - | 0s | 0 | - |" >> "$WORK_LOG"
+fi
+
+# ══════════════════════════════════════
+# S 级 Fast Track 通道
+# ══════════════════════════════════════
+
+S_TRACK_DONE=false
+
+if [ "$COMPLEXITY" = "S" ]; then
+    S_TRACK_START=$(date +%s)
+    S_TRACK_START_FMT=$(date '+%H:%M:%S')
+
+    # ── 检查 S 级调研充分性：不充分则升级到 M ──
+    if [ "${S_RESEARCH_INSUFFICIENT:-false}" = "true" ]; then
+        echo "[S-Track] 调研不充分，升级到 M 级通道"
+        record_upgrade S M
+        COMPLEXITY=M
+        UPGRADE_COUNT=$((UPGRADE_COUNT + 1))
+        PLAN_MAX_ROUNDS=1
+        DEV_MAX_ROUNDS=10
+        COMPLETED_TASKS=0
+        FAILED_TASKS=0
+        TOTAL_TASKS=0
+        S_TRACK_END=$(date +%s)
+        S_TRACK_DURATION=$((S_TRACK_END - S_TRACK_START))
+        DEV_DURATION=$S_TRACK_DURATION
+        echo "| S-Track 调研 | 已升级→M | ${S_TRACK_START_FMT} | $(date '+%H:%M:%S') | ${S_TRACK_DURATION}s | ${CLI_CALL_COUNT} | 调研不充分，升级 |" >> "$WORK_LOG"
+        S_TRACK_DONE=true
+    fi
+
+    if [ "$S_TRACK_DONE" != "true" ]; then
+    use_model_code  # S-Track 开发阶段切换到编码模型
+    mark_stage "s-track-dev"
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  S 级 Fast Track：直接开发"
+    echo "══════════════════════════════════════"
+
+    PRE_S_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+    S_DEV_CLI_START=$CLI_CALL_COUNT
+
+    # ── S 级直接开发：单次 cli_call ──
+    S_DEV_PROMPT="请直接实现以下需求。
+
+需求内容：
+${REQUIREMENT}
+
+规则：
+1. 搜索项目中相似的实现作为参考模板
+2. 直接编写代码实现需求
+3. 完成后确保编译通过：
+   - Go: cd Backend && go build ./...
+   - TS: cd MCP && npx tsc --noEmit（如果修改了 MCP）
+   - TS: cd Frontend && npx tsc --noEmit（如果修改了 Client）
+4. 为新增代码编写测试
+5. 不要生成 plan.md 或 feature.md
+6. 不要向用户提问，直接完成"
+
+    cli_call "$S_DEV_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+
+    # ── S 级集成验证门禁 ──
+    echo "[S-Track] 集成验证门禁..."
+    S_GATE_OK=1
+
+    if [ -d "Backend" ]; then
+        if ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] Go Server 编译: FAIL"
+            S_GATE_OK=0
+        else
+            echo "  [GATE] Go Server 编译: OK"
+        fi
+    fi
+
+    if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
+        if ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] TS MCP 编译: FAIL"
+            S_GATE_OK=0
+        else
+            echo "  [GATE] TS MCP 编译: OK"
+        fi
+    fi
+
+    if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ]; then
+        if ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] TS Client 编译: FAIL"
+            S_GATE_OK=0
+        else
+            echo "  [GATE] TS Client 编译: OK"
+        fi
+    fi
+
+    # ── S 级失败重试（最多 1 次） ──
+    S_RETRY=0
+
+    if [ "$S_GATE_OK" -eq 0 ] && [ "$S_RETRY" -lt 1 ]; then
+        S_RETRY=$((S_RETRY + 1))
+        echo "[S-Track] 门禁失败，重试 ${S_RETRY}/1..."
+
+        S_ERRORS=""
+        [ -d "Backend" ] && S_ERRORS+=$(cd Backend && go build ./... 2>&1 | head -20 || true)$'
+'
+        [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && S_ERRORS+=$(cd MCP && npx tsc --noEmit 2>&1 | head -20 || true)$'
+'
+        [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && S_ERRORS+=$(cd Frontend && npx tsc --noEmit 2>&1 | head -20 || true)$'
+'
+
+        S_FIX_PROMPT="S 级开发后编译失败。请修复以下编译错误：
+
+\`\`\`
+${S_ERRORS}
+\`\`\`
+
+只修复编译问题，不做其他改动。"
+
+        cli_call "$S_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+
+        # 重新验证
+        S_GATE_OK=1
+        if [ -d "Backend" ] && ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
+            S_GATE_OK=0
+        fi
+        if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            S_GATE_OK=0
+        fi
+        if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            S_GATE_OK=0
+        fi
+    fi
+
+    if [ "$S_GATE_OK" -eq 0 ]; then
+        # 重试后仍失败，标记需升级到 M
+        echo "[S-Track] 重试后仍失败，升级到 M 级通道"
+        record_upgrade S M
+        COMPLEXITY=M
+        UPGRADE_COUNT=$((UPGRADE_COUNT + 1))
+        PLAN_MAX_ROUNDS=1
+        DEV_MAX_ROUNDS=10
+        COMPLETED_TASKS=0
+        FAILED_TASKS=0
+        TOTAL_TASKS=0
+        S_TRACK_END=$(date +%s)
+        S_TRACK_DURATION=$((S_TRACK_END - S_TRACK_START))
+        echo "| S-Track 开发 | 已升级→M | ${S_TRACK_START_FMT} | $(date '+%H:%M:%S') | ${S_TRACK_DURATION}s | ${CLI_CALL_COUNT} | 门禁失败，已升级 |" >> "$WORK_LOG"
+        DEV_DURATION=$S_TRACK_DURATION
+        S_TRACK_DONE=true
+    else
+        # ── S 级测试验证门禁 ──
+        echo "[S-Track] 测试验证门禁..."
+        S_TEST_OK=1
+
+        # 获取 S-Track 变更文件列表
+        S_CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null || echo "")
+        if [ -z "$S_CHANGED_FILES" ]; then
+            S_CHANGED_FILES=$(git status --porcelain 2>/dev/null | awk '{print $2}')
+        fi
+
+        S_HAS_GO=0; S_HAS_TS=0; S_HAS_PY=0
+        S_GO_PKGS=""; S_TS_FILES=""; S_PY_FILES=""
+
+        while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+                Backend/*.go|Engine/*.go)
+                    S_HAS_GO=1
+                    pkg_dir=$(dirname "$file")
+                    case "$file" in
+                        Backend/*) S_GO_PKGS="${S_GO_PKGS} ./${pkg_dir#Backend/}/..." ;;
+                        Engine/*) S_GO_PKGS="${S_GO_PKGS} ./${pkg_dir#Engine/}/..." ;;
+                    esac
+                    ;;
+                MCP/*.ts|MCP/*.tsx|Frontend/*.ts|Frontend/*.tsx)
+                    S_HAS_TS=1; S_TS_FILES="${S_TS_FILES} ${file}" ;;
+                Tools/*.py)
+                    S_HAS_PY=1
+                    test_file=$(echo "$file" | sed 's/\([^/]*\)\.py$/test_.py/')
+                    [ -f "$test_file" ] && S_PY_FILES="${S_PY_FILES} ${test_file}"
+                    ;;
+            esac
+        done <<< "$S_CHANGED_FILES"
+
+        [ -n "$S_GO_PKGS" ] && S_GO_PKGS=$(echo "$S_GO_PKGS" | tr ' ' '
+' | sort -u | tr '
+' ' ')
+
+        S_TEST_FAILURES=""
+
+        if [ "$S_HAS_GO" -eq 1 ] && [ -d "Backend" ]; then
+            echo "  [TEST] Go: go test -short -count=1 ${S_GO_PKGS}"
+            S_GO_OUTPUT=$(cd Backend && go test -short -count=1 $S_GO_PKGS 2>&1) || true
+            S_GO_FAIL=$(echo "$S_GO_OUTPUT" | grep -c "^FAIL" 2>/dev/null || true)
+            S_GO_FAIL=$(echo "$S_GO_FAIL" | tail -1 | tr -d '\r')
+            S_GO_FAIL=${S_GO_FAIL:-0}
+            if [ "$S_GO_FAIL" -gt 0 ]; then
+                S_TEST_OK=0
+                S_TEST_FAILURES="${S_TEST_FAILURES}
+[Go Test Failures]
+$(echo "$S_GO_OUTPUT" | grep -E 'FAIL|Error|panic|---' | head -30)"
+                echo "  [TEST] Go: FAIL"
+            else
+                echo "  [TEST] Go: PASS"
+            fi
+        fi
+
+        if [ "$S_HAS_TS" -eq 1 ]; then
+            S_MCP_FILES=$(echo "$S_TS_FILES" | tr ' ' '
+' | grep "^MCP/" | tr '
+' ' ' || true)
+            if [ -n "$S_MCP_FILES" ] && [ -d "MCP" ]; then
+                echo "  [TEST] TS MCP: npx jest --findRelatedTests ${S_MCP_FILES}"
+                S_MCP_OUTPUT=$(cd MCP && npx jest --findRelatedTests $S_MCP_FILES 2>&1) || true
+                if echo "$S_MCP_OUTPUT" | grep -q "Tests:.*failed"; then
+                    S_TEST_OK=0
+                    S_TEST_FAILURES="${S_TEST_FAILURES}
+[TS MCP Test Failures]
+$(echo "$S_MCP_OUTPUT" | tail -20)"
+                    echo "  [TEST] TS MCP: FAIL"
+                else
+                    echo "  [TEST] TS MCP: PASS"
+                fi
+            fi
+
+            S_CLIENT_FILES=$(echo "$S_TS_FILES" | tr ' ' '
+' | grep "^Frontend/" | tr '
+' ' ' || true)
+            if [ -n "$S_CLIENT_FILES" ] && [ -d "Frontend" ]; then
+                echo "  [TEST] TS Client: npx jest --findRelatedTests ${S_CLIENT_FILES}"
+                S_CLIENT_OUTPUT=$(cd Frontend && npx jest --findRelatedTests $S_CLIENT_FILES 2>&1) || true
+                if echo "$S_CLIENT_OUTPUT" | grep -q "Tests:.*failed"; then
+                    S_TEST_OK=0
+                    S_TEST_FAILURES="${S_TEST_FAILURES}
+[TS Client Test Failures]
+$(echo "$S_CLIENT_OUTPUT" | tail -20)"
+                    echo "  [TEST] TS Client: FAIL"
+                else
+                    echo "  [TEST] TS Client: PASS"
+                fi
+            fi
+        fi
+
+        if [ "$S_HAS_PY" -eq 1 ] && [ -n "$S_PY_FILES" ]; then
+            echo "  [TEST] Python: pytest ${S_PY_FILES}"
+            S_PY_OUTPUT=$(pytest $S_PY_FILES 2>&1) || true
+            if echo "$S_PY_OUTPUT" | grep -q "failed"; then
+                S_TEST_OK=0
+                S_TEST_FAILURES="${S_TEST_FAILURES}
+[Python Test Failures]
+$(echo "$S_PY_OUTPUT" | tail -20)"
+                echo "  [TEST] Python: FAIL"
+            else
+                echo "  [TEST] Python: PASS"
+            fi
+        fi
+
+        # 测试失败：尝试一次修复
+        if [ "$S_TEST_OK" -eq 0 ]; then
+            echo "[S-Track] 测试失败，尝试修复..."
+            S_TEST_FIX_PROMPT="S 级开发后测试失败。请分析并修复以下测试错误：
+
+\`\`\`
+${S_TEST_FAILURES}
+\`\`\`
+
+规则：
+- 分析失败原因，判断是代码 bug 还是测试需要更新
+- 只修复与本次变更相关的测试失败
+- 修复后确保编译仍然通过"
+            cli_call "$S_TEST_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+
+            # 重新运行测试验证
+            S_TEST_OK=1
+            if [ "$S_HAS_GO" -eq 1 ] && [ -d "Backend" ]; then
+                S_GO_RETEST=$(cd Backend && go test -short -count=1 $S_GO_PKGS 2>&1) || true
+                if echo "$S_GO_RETEST" | grep -q "^FAIL"; then S_TEST_OK=0; fi
+            fi
+            if [ "$S_HAS_TS" -eq 1 ]; then
+                if [ -n "$S_MCP_FILES" ] && [ -d "MCP" ]; then
+                    S_MCP_RETEST=$(cd MCP && npx jest --findRelatedTests $S_MCP_FILES 2>&1) || true
+                    if echo "$S_MCP_RETEST" | grep -q "Tests:.*failed"; then S_TEST_OK=0; fi
+                fi
+                if [ -n "$S_CLIENT_FILES" ] && [ -d "Frontend" ]; then
+                    S_CLIENT_RETEST=$(cd Frontend && npx jest --findRelatedTests $S_CLIENT_FILES 2>&1) || true
+                    if echo "$S_CLIENT_RETEST" | grep -q "Tests:.*failed"; then S_TEST_OK=0; fi
+                fi
+            fi
+            if [ "$S_HAS_PY" -eq 1 ] && [ -n "$S_PY_FILES" ]; then
+                S_PY_RETEST=$(pytest $S_PY_FILES 2>&1) || true
+                if echo "$S_PY_RETEST" | grep -q "failed"; then S_TEST_OK=0; fi
+            fi
+        fi
+
+        if [ "$S_TEST_OK" -eq 0 ]; then
+            echo "[S-Track] 测试修复后仍失败，升级到 M 级通道"
+            record_upgrade S M
+            COMPLEXITY=M
+            UPGRADE_COUNT=$((UPGRADE_COUNT + 1))
+            PLAN_MAX_ROUNDS=1
+            DEV_MAX_ROUNDS=10
+            COMPLETED_TASKS=0
+            FAILED_TASKS=0
+            TOTAL_TASKS=0
+            S_TRACK_END=$(date +%s)
+            S_TRACK_DURATION=$((S_TRACK_END - S_TRACK_START))
+            DEV_DURATION=$S_TRACK_DURATION
+            echo "| S-Track 测试 | 已升级→M | ${S_TRACK_START_FMT} | $(date '+%H:%M:%S') | ${S_TRACK_DURATION}s | ${CLI_CALL_COUNT} | 测试门禁失败，已升级 |" >> "$WORK_LOG"
+            S_TRACK_DONE=true
+        else
+            echo "  [TEST GATE] S-Track 测试通过"
+        fi
+    fi
+
+    if [ "$S_TRACK_DONE" != "true" ]; then
+        # ── S 级提交 ──
+        echo "[S-Track] 提交变更..."
+        HAS_S_CHANGES=$(git status --porcelain 2>/dev/null | grep -v '^??' | head -1 || echo "")
+        POST_S_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+        if [ -n "$HAS_S_CHANGES" ] || [ "$POST_S_HEAD" != "$PRE_S_HEAD" ]; then
+            S_COMMIT_MSG="feat(${FEATURE_NAME}): S-Track 快速实现
+
+版本：${VERSION_ID}
+通道：S-Track Fast
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
+
+            S_COMMIT_PROMPT="请提交当前所有代码变更：
+1. git status 查看变更
+2. git add 逐个添加代码文件（排除 .env、credentials、Docs/ 下的日志文件）
+3. 用以下 commit message 提交（直接用 git commit -m 即可）：
+   feat(${FEATURE_NAME}): S-Track 快速实现
+4. 如果没有变更，输出 NO_CHANGES
+5. 如果成功，输出 COMMIT_SUCCESS
+6. commit message 必须包含 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
+
+            cli_call "$S_COMMIT_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+        fi
+
+        # 验证 commit 是否产生
+        FINAL_S_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+        if [ "$FINAL_S_HEAD" != "$PRE_S_HEAD" ]; then
+            S_COMMIT_HASH=$(git log -1 --format="%h" 2>/dev/null)
+            echo "S-Track COMMIT_VERIFIED: ${S_COMMIT_HASH}"
+        fi
+
+        COMPLETED_TASKS=1
+        FAILED_TASKS=0
+        TOTAL_TASKS=1
+
+        # ── S 级文档：基于 git diff 生成变更说明（不生成 develop-log.md） ──
+        echo "[S-Track] 生成变更说明..."
+        S_DIFF_STAT=$(git diff "${PRE_S_HEAD}..HEAD" --stat 2>/dev/null || echo "无变更")
+        S_DIFF_COMMIT_COUNT=$(git rev-list "${PRE_S_HEAD}..HEAD" --count 2>/dev/null || echo "0")
+
+        S_TRACK_END=$(date +%s)
+        S_TRACK_DURATION=$((S_TRACK_END - S_TRACK_START))
+        DEV_DURATION=$S_TRACK_DURATION
+
+        echo "| S-Track 开发 | 完成 | ${S_TRACK_START_FMT} | $(date '+%H:%M:%S') | ${S_TRACK_DURATION}s | ${CLI_CALL_COUNT} | Fast Track, ${S_DIFF_COMMIT_COUNT} commits |" >> "$WORK_LOG"
+        echo "S-Track 完成 ($(format_duration $S_TRACK_DURATION))"
+        S_TRACK_DONE=true
+    fi  # end: S_TRACK_DONE != true (test gate passed, commit path)
+    fi  # end: S_TRACK_DONE != true (S research sufficient)
+fi
+
+# ══════════════════════════════════════
+# 阶段一～四：常规通道（S 级已在 Fast Track 中完成，跳过）
+# ══════════════════════════════════════
+
+if [ "$S_TRACK_DONE" != "true" ] || [ -n "$UPGRADED_FROM" ]; then
+
+use_model_light  # 阶段一～三（feature/plan/task-split）用轻量模型
+
+# ══════════════════════════════════════
+# 阶段一：生成 feature.md
+# ══════════════════════════════════════
+
+STAGE1_START=$(date +%s)
+STAGE1_START_FMT=$(date '+%H:%M:%S')
+mark_stage "feature-gen"
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段一：生成 feature.md"
+echo "══════════════════════════════════════"
+
+if [ -f "${FEATURE_DIR}/feature.md" ] || [ -f "${FEATURE_DIR}/feature.json" ]; then
+    echo "feature 文档已存在，跳过生成"
+    echo "| 生成 feature | 跳过（已存在） | ${STAGE1_START_FMT} | ${STAGE1_START_FMT} | 0s | 0 | - |" >> "$WORK_LOG"
+else
+    PROMPT="请根据以下需求生成功能需求文档，写入 ${FEATURE_DIR}/feature.md。
+
+需求输入：
+${REQUIREMENT}
+
+如果需求涉及已有系统，搜索相关代码了解现有实现。
+
+输出格式参考 .claude/templates/feature.tpl.md（如存在），否则使用以下结构：
+# {功能名称}
+## 概述 — 一段话描述功能目标
+## 需求列表 — 每条 REQ-NNN: {标题} [P0/P1/P2]，含分类、模块、描述、验收条件
+## 交互设计 — 用户使用流程
+## 技术约束 — 表格列出
+## 依赖关系
+## 备注 — 不确定项标注 [待确认]
+
+规则：
+- 不凭空捏造用户没提到的大功能
+- 每条 requirement 必须带验收条件
+- P0=核心必做, P1=重要, P2=可选
+- 直接写文件，不要向用户提问"
+
+    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
+
+    if [ ! -f "${FEATURE_DIR}/feature.md" ]; then
+        echo "ERROR: feature.md 生成失败"
+        echo "| 生成 feature.md | 失败 | ${STAGE1_START_FMT} | - | - | ${CLI_CALL_COUNT} | 文件未生成 |" >> "$WORK_LOG"
+        exit 1
+    fi
+
+    STAGE1_END=$(date +%s)
+    STAGE1_END_FMT=$(date '+%H:%M:%S')
+    STAGE1_DURATION=$((STAGE1_END - STAGE1_START))
+    PLAN_DURATION=$((PLAN_DURATION + STAGE1_DURATION))
+    echo "| 生成 feature.md | 完成 | ${STAGE1_START_FMT} | ${STAGE1_END_FMT} | ${STAGE1_DURATION}s | ${CLI_CALL_COUNT} | - |" >> "$WORK_LOG"
+    echo "feature.md 生成完成 (${STAGE1_DURATION}s)"
+fi
+
+# ══════════════════════════════════════
+# 待确认项确认（阶段一～二之间）
+# ══════════════════════════════════════
+check_feature_pending_items
+
+# ══════════════════════════════════════
+# 阶段二：Plan 迭代循环
+# ══════════════════════════════════════
+
+STAGE2_START=$(date +%s)
+STAGE2_START_FMT=$(date '+%H:%M:%S')
+mark_stage "plan-iteration"
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段二：Plan 迭代循环"
+echo "══════════════════════════════════════"
+
+if [ -f "${FEATURE_DIR}/plan.md" ] || [ -f "${FEATURE_DIR}/plan.json" ]; then
+    echo "plan 已存在，跳过 Plan 阶段"
+    echo "| Plan 迭代 | 跳过（已存在） | ${STAGE2_START_FMT} | ${STAGE2_START_FMT} | 0s | 0 | - |" >> "$WORK_LOG"
+else
+    if [ "$COMPLEXITY" = "M" ]; then
+        # ── M 级 Standard Track：一次生成 + 一次 Codex Review ──
+        echo "[M-Track] 执行单次生成 + Codex 单轮审查..."
+        bash .claude/scripts/feature-plan-loop.sh "$VERSION_ID" "$FEATURE_NAME" 2 || true
+
+        STAGE2_END=$(date +%s)
+        STAGE2_END_FMT=$(date '+%H:%M:%S')
+        STAGE2_DURATION=$((STAGE2_END - STAGE2_START))
+
+        if [ ! -f "${FEATURE_DIR}/plan.md" ] && [ ! -f "${FEATURE_DIR}/plan.json" ]; then
+            echo "ERROR: M-Track Plan 生成失败，plan.md 未创建"
+            echo "| Plan 生成(M) | 失败 | ${STAGE2_START_FMT} | ${STAGE2_END_FMT} | ${STAGE2_DURATION}s | ${CLI_CALL_COUNT} | plan.md 未生成 |" >> "$WORK_LOG"
+            exit 1
+        fi
+
+        PLAN_DURATION=$((PLAN_DURATION + STAGE2_DURATION))
+        echo "| Plan 生成(M) | 完成 | ${STAGE2_START_FMT} | ${STAGE2_END_FMT} | ${STAGE2_DURATION}s | ${CLI_CALL_COUNT} | M-Track 单次生成 + Codex 单轮审查 |" >> "$WORK_LOG"
+        echo "Plan 生成完成 - M-Track (${STAGE2_DURATION}s)"
+    else
+        # ── L 级 Full Track：调用 feature-plan-loop.sh 迭代生成 ──
+        PLAN_EXIT=0
+        bash .claude/scripts/feature-plan-loop.sh "$VERSION_ID" "$FEATURE_NAME" "$PLAN_MAX_ROUNDS" || PLAN_EXIT=$?
+
+        STAGE2_END=$(date +%s)
+        STAGE2_END_FMT=$(date '+%H:%M:%S')
+        STAGE2_DURATION=$((STAGE2_END - STAGE2_START))
+
+        if [ $PLAN_EXIT -ne 0 ] || { [ ! -f "${FEATURE_DIR}/plan.md" ] && [ ! -f "${FEATURE_DIR}/plan.json" ]; }; then
+            echo "ERROR: Plan 阶段失败"
+            echo "| Plan 迭代 | 失败 | ${STAGE2_START_FMT} | ${STAGE2_END_FMT} | ${STAGE2_DURATION}s | ${CLI_CALL_COUNT} | exit=$PLAN_EXIT |" >> "$WORK_LOG"
+            exit 1
+        fi
+
+        PLAN_SUMMARY=""
+        if [ -f "${FEATURE_DIR}/plan-iteration-log.md" ]; then
+            PLAN_SUMMARY=$(tail -5 "${FEATURE_DIR}/plan-iteration-log.md" | grep "终止原因" || echo "")
+        fi
+        PLAN_DURATION=$((PLAN_DURATION + STAGE2_DURATION))
+        echo "| Plan 迭代 | 完成 | ${STAGE2_START_FMT} | ${STAGE2_END_FMT} | ${STAGE2_DURATION}s | ${CLI_CALL_COUNT} | ${PLAN_SUMMARY} |" >> "$WORK_LOG"
+        echo "Plan 阶段完成 (${STAGE2_DURATION}s)"
+    fi
+fi
+
+# ══════════════════════════════════════
+# 阶段三：任务拆分
+# ══════════════════════════════════════
+
+STAGE3_START=$(date +%s)
+STAGE3_START_FMT=$(date '+%H:%M:%S')
+mark_stage "task-split"
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段三：任务拆分"
+echo "══════════════════════════════════════"
+
+TASKS_DIR="${FEATURE_DIR}/tasks"
+
+if [ -d "$TASKS_DIR" ] && ls "$TASKS_DIR"/task-*.md &>/dev/null; then
+    TASK_COUNT=$(ls "$TASKS_DIR"/task-*.md 2>/dev/null | wc -l)
+    echo "tasks/ 已存在（${TASK_COUNT} 个任务），跳过拆分"
+    echo "| 任务拆分 | 跳过（已存在） | ${STAGE3_START_FMT} | ${STAGE3_START_FMT} | 0s | 0 | ${TASK_COUNT} 个任务 |" >> "$WORK_LOG"
+else
+    mkdir -p "$TASKS_DIR"
+
+    # 确定 plan 文件路径
+    PLAN_PATH="${FEATURE_DIR}/plan.md"
+    if [ ! -f "$PLAN_PATH" ]; then
+        PLAN_PATH="${FEATURE_DIR}/plan.json"
+    fi
+
+    PROMPT="你是一名资深全栈开发工程师。请将技术方案拆分为可独立开发、验证、提交的任务。
+
+**核心原则：一个任务 = 一个独立功能点 = 一个 git commit。**
+每个任务必须足够细致，完成后能作为一个有意义的独立 commit 提交，让 git log 清晰可读。
+
+请读取以下文件：
+1. ${PLAN_PATH} — 技术方案
+2. ${FEATURE_DIR}/feature.md（或 feature.json）— 功能需求
+3. 如果 ${FEATURE_DIR}/plan/ 子目录存在，也读取其中的子文件
+
+拆分规则：
+- **单一职责**：每个任务只做一件事（一个接口、一个组件、一层数据模型、一组配置）
+- 每个任务必须是**可独立编译验证**的最小单元（做完这个任务后，代码能编译通过）
+- 每个任务完成后能产出一个**语义明确的 git commit**（commit message 能精准描述这个任务做了什么）
+- 任务按依赖顺序排列（被依赖的在前）
+- 粒度参考：一个任务通常包含 1-3 个文件的新增/修改
+- 典型拆分维度（每个维度可进一步拆分为多个任务）：
+  1. 数据模型定义（struct/interface/type）
+  2. Repository 层实现（数据访问）
+  3. Service 层业务逻辑（每个核心方法可独立为一个任务）
+  4. Handler/路由注册
+  5. MCP 工具（每个工具一个任务）
+  6. 前端组件（每个页面/组件一个任务）
+  7. 配置/集成联调（路由注册、环境变量、Docker 等）
+  8. 测试补全（单元测试、smoke 测试）
+
+每个任务输出为独立文件 ${TASKS_DIR}/task-NN.md（NN 从 01 开始），格式：
+
+\`\`\`markdown
+---
+name: 简短任务名（如：定义 Game 数据模型）
+status: pending
+estimated_files: 2
+estimated_lines: 80
+verify_commands:
+  - \"go build ./...\"
+  - \"go vet ./affected_package/...\"
+depends_on: [\"task-01\"]
+---
+
+## 范围
+- 新增: path/to/file1.go — 职责描述
+- 新增: path/to/file2.ts — 职责描述
+- 修改: path/to/existing.go — 修改描述
+
+## 验证标准
+- Go: go build ./... 编译通过
+- TS: npx tsc --noEmit 通过
+- （其他具体验证点）
+
+## 依赖
+- 无 / 依赖 task-01
+\`\`\`
+
+**元数据字段说明：**
+- estimated_files: 预计改动的**实现文件**数，必须 ≤3。超过 3 个文件的任务必须进一步拆分。注意：宪法 2.4 要求新增 HTTP 端点必须同步添加 router_test.go 条目和 .hurl 冒烟测试，这些伴生测试文件不计入 estimated_files（它们是合规附件，不是独立功能）。
+- estimated_lines: 预计改动行数，必须 ≤100。超过 100 行的任务必须进一步拆分。
+- verify_commands: 验证命令列表，每条命令必须是只读/无副作用的（如 go build、tsc --noEmit、bash -n、pytest --collect-only）。禁止包含写入、删除、部署等有副作用的命令。
+- depends_on: 依赖任务列表，如 [\"task-01\", \"task-03\"]。无依赖则为 []。必须显式声明，不能省略。
+
+**粒度约束（必须遵守）：**
+- 单个任务 estimated_files ≤ 3（仅计实现文件；宪法 2.4 伴生测试 router_test.go/.hurl 不计入），超过则必须拆分
+- 单个任务 estimated_lines ≤ 100，超过则必须拆分为更小的任务
+- 拆分后每个子任务仍需能独立编译验证
+- **拆分检验标准**：如果一个任务的 commit message 需要用"和"连接两个不同的动作（如"定义模型和实现接口"），说明它应该被拆成两个任务
+
+同时生成 ${TASKS_DIR}/README.md 索引文件，包含：
+1. 任务列表表格，列：编号、名称、依赖、预估文件数、预估行数、状态
+2. 并行组（Group）标注，格式：
+   Group 1 (无依赖): task-01, task-02
+   Group 2 (依赖 Group 1): task-03, task-04
+   Group 3 (依赖 task-03): task-05
+   将无依赖关系的任务归入同一并行组，标明该 Group 的前置依赖。
+
+注意：
+- **宁可多拆不要少拆**：每个任务完成后就是一个独立的 commit，粒度越细 git 历史越清晰
+- 确保每个任务完成后代码状态是健康的（能编译，不会有悬空引用）
+- depends_on 必须显式列出，即使为空也要写 []
+- 每个任务的 name 应该能直接作为 commit message 的描述（如：\"定义 Game 数据模型\"、\"实现 GameRepository MongoDB 适配\"）"
+
+    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
+
+    TASK_COUNT=$(ls "$TASKS_DIR"/task-*.md 2>/dev/null | wc -l)
+    if [ "$TASK_COUNT" -eq 0 ]; then
+        echo "ERROR: 任务拆分失败，未生成任何 task 文件"
+        echo "| 任务拆分 | 失败 | ${STAGE3_START_FMT} | - | - | ${CLI_CALL_COUNT} | 未生成 task 文件 |" >> "$WORK_LOG"
+        exit 1
+    fi
+
+    STAGE3_END=$(date +%s)
+    STAGE3_END_FMT=$(date '+%H:%M:%S')
+    STAGE3_DURATION=$((STAGE3_END - STAGE3_START))
+    PLAN_DURATION=$((PLAN_DURATION + STAGE3_DURATION))
+    echo "| 任务拆分 | 完成 | ${STAGE3_START_FMT} | ${STAGE3_END_FMT} | ${STAGE3_DURATION}s | ${CLI_CALL_COUNT} | ${TASK_COUNT} 个任务 |" >> "$WORK_LOG"
+    echo "任务拆分完成：${TASK_COUNT} 个任务 (${STAGE3_DURATION}s)"
+fi
+
+# ══════════════════════════════════════
+# 阶段四：逐任务开发 + 提交
+# ══════════════════════════════════════
+
+use_model_code  # 开发阶段切换到编码模型
+
+STAGE4_START=$(date +%s)
+STAGE4_START_FMT=$(date '+%H:%M:%S')
+mark_stage "task-dev"
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段四：逐任务开发 + 提交"
+echo "══════════════════════════════════════"
+
+# DEV_MAX_ROUNDS 已在参数路由表中按 M/L 级赋值
+PRE_DEV_HEAD_ALL=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+TASK_FILES=$(ls "$TASKS_DIR"/task-*.md 2>/dev/null | sort)
+TOTAL_TASKS=$(echo "$TASK_FILES" | wc -l)
+COMPLETED_TASKS=0
+FAILED_TASKS=0
+
+for TASK_FILE in $TASK_FILES; do
+    TASK_BASENAME=$(basename "$TASK_FILE" .md)
+    TASK_NUM=$((COMPLETED_TASKS + FAILED_TASKS + 1))
+
+    # 读取任务名称（跳过检查也需要）
+    TASK_NAME=$(grep "^name:" "$TASK_FILE" | sed 's/^name: *//' || echo "$TASK_BASENAME")
+
+    # 检查任务状态（跳过已完成的）— 带 git commit 验证
+    if grep -qE "status: (completed|done)" "$TASK_FILE" 2>/dev/null; then
+        # 验证：对应的 commit 是否真的存在于 git 历史中
+        COMMIT_EXISTS=$(git log --oneline --all --grep="(${FEATURE_NAME}): ${TASK_NAME}" 2>/dev/null | head -1 || echo "")
+        if [ -n "$COMMIT_EXISTS" ]; then
+            echo ""
+            echo "── [${TASK_NUM}/${TOTAL_TASKS}] ${TASK_BASENAME} — 已完成且 commit 已验证，跳过 ──"
+            COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
+            continue
+        else
+            echo ""
+            echo "WARNING: ${TASK_BASENAME} 标记为已完成但 git 中找不到对应 commit，重新执行"
+            sed -i "s/status: completed/status: pending/" "$TASK_FILE" 2>/dev/null || true
+            sed -i "s/status: done/status: pending/" "$TASK_FILE" 2>/dev/null || true
+            # 清理可能残留的不完整日志
+            rm -f "${FEATURE_DIR}/develop-iteration-log-${TASK_BASENAME}.md" 2>/dev/null || true
+            rm -f "${FEATURE_DIR}/develop-review-report-${TASK_BASENAME}.md" 2>/dev/null || true
+        fi
+    fi
+
+    # 跳过明确失败的任务（需要人工干预）
+    if grep -q "status: failed" "$TASK_FILE" 2>/dev/null; then
+        echo ""
+        echo "── [${TASK_NUM}/${TOTAL_TASKS}] ${TASK_BASENAME} — 之前失败，重试 ──"
+        sed -i "s/status: failed/status: pending/" "$TASK_FILE" 2>/dev/null || true
+    fi
+
+    mark_stage "task-dev" "$TASK_BASENAME"
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  [${TASK_NUM}/${TOTAL_TASKS}] ${TASK_BASENAME}"
+    echo "══════════════════════════════════════"
+
+    TASK_START=$(date +%s)
+    TASK_START_FMT=$(date '+%H:%M:%S')
+
+    # 记录开发前的 git HEAD（用于后续验证）
+    PRE_DEV_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+
+    # ── 开发迭代 ──
+    DEV_EXIT=0
+    bash .claude/scripts/feature-develop-loop.sh "$VERSION_ID" "$FEATURE_NAME" --task "$TASK_FILE" "$DEV_MAX_ROUNDS" || DEV_EXIT=$?
+
+    TASK_END=$(date +%s)
+    TASK_DURATION=$((TASK_END - TASK_START))
+
+    if [ $DEV_EXIT -ne 0 ]; then
+        echo "WARNING: ${TASK_BASENAME} 开发异常 (exit=$DEV_EXIT)"
+        TASK_END_FMT=$(date '+%H:%M:%S')
+        echo "| ${TASK_BASENAME} 开发 | 异常 | ${TASK_START_FMT} | ${TASK_END_FMT} | ${TASK_DURATION}s | ${CLI_CALL_COUNT} | exit=$DEV_EXIT |" >> "$WORK_LOG"
+        FAILED_TASKS=$((FAILED_TASKS + 1))
+        sed -i "s/status: pending/status: failed/" "$TASK_FILE" 2>/dev/null || true
+        continue
+    fi
+
+    # ── 集成验证门禁（原子化：每个任务完成后必须通过全项目编译） ──
+    echo "[${TASK_BASENAME}] 集成验证门禁：全项目编译..."
+    INTEGRATION_OK=1
+
+    if [ -d "Backend" ]; then
+        if ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] Go Server 编译: FAIL"
+            INTEGRATION_OK=0
+        else
+            echo "  [GATE] Go Server 编译: OK"
+        fi
+    fi
+
+    if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
+        if ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] TS MCP 编译: FAIL"
+            INTEGRATION_OK=0
+        else
+            echo "  [GATE] TS MCP 编译: OK"
+        fi
+    fi
+
+    if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ]; then
+        if ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            echo "  [GATE] TS Client 编译: FAIL"
+            INTEGRATION_OK=0
+        else
+            echo "  [GATE] TS Client 编译: OK"
+        fi
+    fi
+
+    if [ "$INTEGRATION_OK" -eq 0 ]; then
+        echo "WARNING: ${TASK_BASENAME} 集成验证失败，尝试自动修复..."
+        INTEGRATION_ERRORS=""
+        [ -d "Backend" ] && INTEGRATION_ERRORS+=$(cd Backend && go build ./... 2>&1 | head -20 || true)$'\n'
+        [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd MCP && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
+        [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd Frontend && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
+
+        GATE_FIX_PROMPT="任务 ${TASK_BASENAME} 完成后集成编译失败。请修复以下编译错误，只修复编译问题，不做其他改动：
+
+\`\`\`
+${INTEGRATION_ERRORS}
+\`\`\`"
+        cli_call "$GATE_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
+
+        # 重新验证修复是否成功
+        INTEGRATION_OK=1
+        if [ -d "Backend" ] && ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
+            INTEGRATION_OK=0
+        fi
+        if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            INTEGRATION_OK=0
+        fi
+        if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+            INTEGRATION_OK=0
+        fi
+
+        if [ "$INTEGRATION_OK" -eq 0 ]; then
+            echo "ERROR: ${TASK_BASENAME} 集成修复失败，编译仍未通过"
+            TASK_END_FMT=$(date '+%H:%M:%S')
+            echo "| ${TASK_BASENAME} | 集成修复失败 | ${TASK_START_FMT} | ${TASK_END_FMT} | ${TASK_DURATION}s | ${CLI_CALL_COUNT} | 编译门禁未通过 |" >> "$WORK_LOG"
+            FAILED_TASKS=$((FAILED_TASKS + 1))
+            sed -i "s/status: pending/status: failed/" "$TASK_FILE" 2>/dev/null || true
+            continue
+        fi
+        echo "| ${TASK_BASENAME} 集成修复 | 成功 | - | - | - | ${CLI_CALL_COUNT} | 编译门禁 |" >> "$WORK_LOG"
+    fi
+
+    # ── 测试门禁：检测变更模块类型并运行对应测试 ──
+    echo "[${TASK_BASENAME}] 测试门禁：检测变更并运行测试..."
+    TEST_GATE_OK=1
+    TEST_FIX_ATTEMPTS=0
+    MAX_TEST_FIX_ATTEMPTS=3
+
+    # 获取本任务的变更文件列表
+    CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null || echo "")
+    if [ -z "$CHANGED_FILES" ]; then
+        CHANGED_FILES=$(git status --porcelain 2>/dev/null | awk '{print $2}')
+    fi
+
+    # 检测变更模块类型
+    HAS_GO_CHANGES=0
+    HAS_TS_CHANGES=0
+    HAS_PY_CHANGES=0
+    GO_AFFECTED_PACKAGES=""
+    TS_AFFECTED_FILES=""
+    PY_AFFECTED_FILES=""
+
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        case "$file" in
+            Backend/*.go)
+                HAS_GO_CHANGES=1
+                pkg_dir=$(dirname "$file")
+                GO_AFFECTED_PACKAGES="${GO_AFFECTED_PACKAGES} ./${pkg_dir#Backend/}/..."
+                ;;
+            Engine/*.go)
+                HAS_GO_CHANGES=1
+                pkg_dir=$(dirname "$file")
+                GO_AFFECTED_PACKAGES="${GO_AFFECTED_PACKAGES} ./${pkg_dir#Engine/}/..."
+                ;;
+            MCP/*.ts|MCP/*.tsx|Frontend/*.ts|Frontend/*.tsx)
+                HAS_TS_CHANGES=1
+                TS_AFFECTED_FILES="${TS_AFFECTED_FILES} ${file}"
+                ;;
+            Tools/*.py)
+                HAS_PY_CHANGES=1
+                test_file=$(echo "$file" | sed 's/\([^/]*\)\.py$/test_\1.py/')
+                if [ -f "$test_file" ]; then
+                    PY_AFFECTED_FILES="${PY_AFFECTED_FILES} ${test_file}"
+                fi
+                ;;
+        esac
+    done <<< "$CHANGED_FILES"
+
+    # 去重 Go 包路径
+    if [ -n "$GO_AFFECTED_PACKAGES" ]; then
+        GO_AFFECTED_PACKAGES=$(echo "$GO_AFFECTED_PACKAGES" | tr ' ' '
+' | sort -u | tr '
+' ' ')
+    fi
+
+    # 运行测试 + 修复循环
+    while [ "$TEST_FIX_ATTEMPTS" -le "$MAX_TEST_FIX_ATTEMPTS" ]; do
+        TEST_FAILURES=""
+        TEST_GATE_OK=1
+
+        # Go 测试
+        if [ "$HAS_GO_CHANGES" -eq 1 ] && [ -d "Backend" ]; then
+            echo "  [TEST] Go: go test -short -count=1 ${GO_AFFECTED_PACKAGES}"
+            GO_TEST_OUTPUT=$(cd Backend && go test -short -count=1 $GO_AFFECTED_PACKAGES 2>&1) || true
+            GO_TEST_FAIL=$(echo "$GO_TEST_OUTPUT" | grep -c "^FAIL" 2>/dev/null || true)
+            GO_TEST_FAIL=$(echo "$GO_TEST_FAIL" | tail -1 | tr -d '\r')
+            GO_TEST_FAIL=${GO_TEST_FAIL:-0}
+            if [ "$GO_TEST_FAIL" -gt 0 ]; then
+                TEST_GATE_OK=0
+                TEST_FAILURES="${TEST_FAILURES}
+[Go Test Failures]
+$(echo "$GO_TEST_OUTPUT" | grep -E 'FAIL|Error|panic|---' | head -30)"
+                echo "  [TEST] Go: FAIL (${GO_TEST_FAIL} packages)"
+            else
+                echo "  [TEST] Go: PASS"
+            fi
+        fi
+
+        # TypeScript 测试
+        if [ "$HAS_TS_CHANGES" -eq 1 ]; then
+            MCP_FILES=$(echo "$TS_AFFECTED_FILES" | tr ' ' '
+' | grep "^MCP/" | tr '
+' ' ' || true)
+            if [ -n "$MCP_FILES" ] && [ -d "MCP" ]; then
+                echo "  [TEST] TS MCP: npx jest --findRelatedTests ${MCP_FILES}"
+                TS_MCP_OUTPUT=$(cd MCP && npx jest --findRelatedTests $MCP_FILES 2>&1) || true
+                if echo "$TS_MCP_OUTPUT" | grep -q "Tests:.*failed"; then
+                    TEST_GATE_OK=0
+                    TEST_FAILURES="${TEST_FAILURES}
+[TS MCP Test Failures]
+$(echo "$TS_MCP_OUTPUT" | tail -20)"
+                    echo "  [TEST] TS MCP: FAIL"
+                else
+                    echo "  [TEST] TS MCP: PASS"
+                fi
+            fi
+
+            CLIENT_FILES=$(echo "$TS_AFFECTED_FILES" | tr ' ' '
+' | grep "^Frontend/" | tr '
+' ' ' || true)
+            if [ -n "$CLIENT_FILES" ] && [ -d "Frontend" ]; then
+                echo "  [TEST] TS Client: npx jest --findRelatedTests ${CLIENT_FILES}"
+                TS_CLIENT_OUTPUT=$(cd Frontend && npx jest --findRelatedTests $CLIENT_FILES 2>&1) || true
+                if echo "$TS_CLIENT_OUTPUT" | grep -q "Tests:.*failed"; then
+                    TEST_GATE_OK=0
+                    TEST_FAILURES="${TEST_FAILURES}
+[TS Client Test Failures]
+$(echo "$TS_CLIENT_OUTPUT" | tail -20)"
+                    echo "  [TEST] TS Client: FAIL"
+                else
+                    echo "  [TEST] TS Client: PASS"
+                fi
+            fi
+        fi
+
+        # Python 测试
+        if [ "$HAS_PY_CHANGES" -eq 1 ] && [ -n "$PY_AFFECTED_FILES" ]; then
+            echo "  [TEST] Python: pytest ${PY_AFFECTED_FILES}"
+            PY_TEST_OUTPUT=$(pytest $PY_AFFECTED_FILES 2>&1) || true
+            if echo "$PY_TEST_OUTPUT" | grep -q "failed"; then
+                TEST_GATE_OK=0
+                TEST_FAILURES="${TEST_FAILURES}
+[Python Test Failures]
+$(echo "$PY_TEST_OUTPUT" | tail -20)"
+                echo "  [TEST] Python: FAIL"
+            else
+                echo "  [TEST] Python: PASS"
+            fi
+        fi
+
+        # 测试全部通过
+        if [ "$TEST_GATE_OK" -eq 1 ]; then
+            echo "  [TEST GATE] 所有测试通过"
+            break
+        fi
+
+        # 测试失败，触发修复
+        TEST_FIX_ATTEMPTS=$((TEST_FIX_ATTEMPTS + 1))
+        echo "  [TEST GATE] 测试失败，修复尝试 ${TEST_FIX_ATTEMPTS}/${MAX_TEST_FIX_ATTEMPTS}..."
+
+        if [ "$TEST_FIX_ATTEMPTS" -le "$MAX_TEST_FIX_ATTEMPTS" ]; then
+            TEST_FIX_PROMPT="任务 ${TASK_BASENAME} 的测试未通过。请分析失败原因并修复。
+
+测试失败详情：
+${TEST_FAILURES}
+修复规则：
+- 分析失败的测试用例，判断是代码 bug 还是测试需要更新
+- 只修复与本任务相关的测试失败
+- 修复后确保编译仍然通过
+- 不做额外重构或改动"
+            cli_call "$TEST_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
+        fi
+    done
+
+    # 测试修复循环结束后仍然失败
+    if [ "$TEST_GATE_OK" -eq 0 ]; then
+        echo "  [TEST GATE] 测试修复 ${MAX_TEST_FIX_ATTEMPTS} 轮后仍失败，标记 NEEDS_MANUAL_REVIEW"
+        echo "| ${TASK_BASENAME} 测试门禁 | NEEDS_MANUAL_REVIEW | - | - | - | ${CLI_CALL_COUNT} | ${TEST_FIX_ATTEMPTS} 轮修复后仍失败 |" >> "$WORK_LOG"
+    else
+        echo "| ${TASK_BASENAME} 测试门禁 | 通过 | - | - | - | ${CLI_CALL_COUNT} | 修复尝试=${TEST_FIX_ATTEMPTS} |" >> "$WORK_LOG"
+    fi
+
+    # ── 提交到 Git ──
+    echo "[${TASK_BASENAME}] 提交变更到 Git..."
+
+    COMMIT_PROMPT="请执行以下步骤提交代码（遵循 git:commit 规范）：
+
+1. 运行 git status 查看变更
+2. 运行 git diff --stat 查看变更摘要
+3. 运行 git log --oneline -3 查看最近 commit 风格
+4. 如果有变更，用 git add 逐个添加相关文件（禁止 git add . 或 git add -A）
+   - 排除 .env、credentials 等敏感文件
+   - 排除 Docs/ 目录下的临时日志文件（develop-iteration-log*.md、develop-review-report*.md）
+   - 包含所有代码文件变更（.go、.ts、.tsx、.gd、.py、.json 等）
+   - 包含 plan 和 task 文件的状态变更
+5. 根据任务实际内容选择 commit type：feat（新功能）、fix（修复）、refactor（重构）、test（测试）、docs（文档）、chore（配置/杂项）。用以下格式提交（第一行不超过 70 字符）：
+
+git commit -m \"\$(cat <<'COMMITEOF'
+<type>(${FEATURE_NAME}): ${TASK_NAME}
+
+${TASK_BASENAME} · ${VERSION_ID}
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+COMMITEOF
+)\"
+
+将 <type> 替换为上面选定的 commit type。
+
+6. 如果没有变更可提交，直接输出 'NO_CHANGES'
+7. 如果 commit 成功，运行 git status 确认，输出 'COMMIT_SUCCESS'"
+
+    COMMIT_RESULT=$(cli_call "$COMMIT_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10)
+    echo "$COMMIT_RESULT"
+
+    # 实际验证 git commit 是否真的产生了（不信任 Claude 输出）
+    POST_DEV_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+    HAS_UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -v '^??' | head -1 || echo "")
+
+    if [ "$POST_DEV_HEAD" != "$PRE_DEV_HEAD" ]; then
+        # HEAD 变了 → commit 确实产生了
+        COMMIT_HASH=$(git log -1 --format="%h" 2>/dev/null)
+        echo "COMMIT_VERIFIED: ${COMMIT_HASH}"
+        TASK_END_FMT=$(date '+%H:%M:%S')
+        echo "| ${TASK_BASENAME} | 完成+已提交 | ${TASK_START_FMT} | ${TASK_END_FMT} | ${TASK_DURATION}s | ${CLI_CALL_COUNT} | ${TASK_NAME} |" >> "$WORK_LOG"
+        sed -i "s/status: pending/status: completed/" "$TASK_FILE" 2>/dev/null || true
+        COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
+        echo "[${TASK_BASENAME}] 完成 (${TASK_DURATION}s)"
+
+    elif [ -z "$HAS_UNCOMMITTED" ]; then
+        # HEAD 没变，也没有未提交的变更 → 真的没有变更（可能 task 只修改了已提交的文件）
+        echo "NO_CHANGES_VERIFIED: 工作目录干净，HEAD 未变"
+        TASK_END_FMT=$(date '+%H:%M:%S')
+        echo "| ${TASK_BASENAME} | 完成(无变更) | ${TASK_START_FMT} | ${TASK_END_FMT} | ${TASK_DURATION}s | ${CLI_CALL_COUNT} | ${TASK_NAME} |" >> "$WORK_LOG"
+        sed -i "s/status: pending/status: completed/" "$TASK_FILE" 2>/dev/null || true
+        COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
+        echo "[${TASK_BASENAME}] 完成-无变更 (${TASK_DURATION}s)"
+
+    else
+        # HEAD 没变但有未提交的变更 → commit 失败了
+        echo "ERROR: ${TASK_BASENAME} 代码有变更但未成功提交！"
+        echo "  未提交文件:"
+        git status --porcelain 2>/dev/null | grep -v '^??' | head -10
+        TASK_END_FMT=$(date '+%H:%M:%S')
+        echo "| ${TASK_BASENAME} | 提交失败 | ${TASK_START_FMT} | ${TASK_END_FMT} | ${TASK_DURATION}s | ${CLI_CALL_COUNT} | 有变更未提交 |" >> "$WORK_LOG"
+
+        # 尝试二次提交（直接用 git 命令，不依赖 Claude）
+        echo "  尝试直接 git 提交..."
+        # 只 add 已追踪文件的变更，排除敏感文件和临时日志
+        git add -u 2>/dev/null || true
+        git reset HEAD -- '*.env' '*credentials*' 'Docs/*iteration-log*' 'Docs/*review-report*' 2>/dev/null || true
+        if git commit -m "$(cat <<COMMITEOF
+chore(${FEATURE_NAME}): ${TASK_NAME}
+
+[auto-fallback] 任务 ${TASK_BASENAME}：${TASK_NAME}
+版本：${VERSION_ID}
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+COMMITEOF
+)" 2>/dev/null; then
+            COMMIT_HASH=$(git log -1 --format="%h" 2>/dev/null)
+            echo "  二次提交成功: ${COMMIT_HASH}"
+            echo "| ${TASK_BASENAME} | 二次提交成功 | - | - | - | ${CLI_CALL_COUNT} | ${COMMIT_HASH} |" >> "$WORK_LOG"
+            sed -i "s/status: pending/status: completed/" "$TASK_FILE" 2>/dev/null || true
+            COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
+            echo "[${TASK_BASENAME}] 完成-二次提交 (${TASK_DURATION}s)"
+        else
+            echo "  二次提交也失败，标记任务为 failed"
+            FAILED_TASKS=$((FAILED_TASKS + 1))
+            sed -i "s/status: pending/status: failed/" "$TASK_FILE" 2>/dev/null || true
+            echo "[${TASK_BASENAME}] 失败-提交异常 (${TASK_DURATION}s)"
+        fi
+    fi
+done
+
+STAGE4_END=$(date +%s)
+STAGE4_END_FMT=$(date '+%H:%M:%S')
+STAGE4_DURATION=$((STAGE4_END - STAGE4_START))
+DEV_DURATION=$STAGE4_DURATION
+echo "| 逐任务开发 | 完成 | ${STAGE4_START_FMT} | ${STAGE4_END_FMT} | ${STAGE4_DURATION}s | ${CLI_CALL_COUNT} | 成功=${COMPLETED_TASKS} 失败=${FAILED_TASKS} |" >> "$WORK_LOG"
+
+# ══════════════════════════════════════
+# M→L 升级检测（M 级开发达到轮次上限仍未收敛）
+# ══════════════════════════════════════
+
+if [ "$COMPLEXITY" = "M" ] && [ "$FAILED_TASKS" -gt 0 ] && [ -z "$UPGRADED_FROM" ] && [ "$UPGRADE_COUNT" -lt "$MAX_UPGRADE_CHAIN" ]; then
+    # 检查是否有 develop-iteration-log 显示达到上限
+    ML_UPGRADE=false
+    for _ml_log in "${FEATURE_DIR}"/develop-iteration-log-task-*.md; do
+        if [ -f "$_ml_log" ] && grep -q "达到上限" "$_ml_log" 2>/dev/null; then
+            ML_UPGRADE=true
+            break
+        fi
+    done
+
+    if [ "$ML_UPGRADE" = "true" ]; then
+        echo ""
+        echo "[M→L 升级] M 级开发达到轮次上限，升级到 L 级通道..."
+        record_upgrade M L
+        COMPLEXITY=L
+        UPGRADE_COUNT=$((UPGRADE_COUNT + 1))
+        PLAN_MAX_ROUNDS=10
+        DEV_MAX_ROUNDS=15
+        sed -i "s/\*\*通道\*\*: Standard Track/**通道**: Full Track (M→L升级)/" "$WORK_LOG" 2>/dev/null || true
+
+        # 保留已有 feature.md/plan.md，重新 plan-review 迭代
+        use_model_light  # plan/拆分阶段用轻量模型
+        echo "  [M→L] 重新执行 plan-review 迭代..."
+        bash .claude/scripts/feature-plan-loop.sh "$VERSION_ID" "$FEATURE_NAME" "$PLAN_MAX_ROUNDS" || true
+
+        # 重新拆分任务（Stage 3 重新执行）
+        echo "  [M→L] 重新拆分任务..."
+        ML_PLAN_PATH="${FEATURE_DIR}/plan.md"
+        [ ! -f "$ML_PLAN_PATH" ] && ML_PLAN_PATH="${FEATURE_DIR}/plan.json"
+        rm -rf "$TASKS_DIR"
+        mkdir -p "$TASKS_DIR"
+        ML_SPLIT_PROMPT="你是一名资深全栈开发工程师。请将以下技术方案拆分为可独立开发、验证、提交的任务（L 级）。
+
+请读取以下文件：
+1. ${ML_PLAN_PATH}
+2. ${FEATURE_DIR}/feature.md（或 feature.json）
+3. 如果 ${FEATURE_DIR}/plan/ 子目录存在，也读取其中的子文件
+
+拆分规则：一个任务 = 一个独立功能点 = 一个 git commit。每任务 ≤3 个文件，≤100 行，按依赖顺序排列。
+输出 ${TASKS_DIR}/task-NN.md（NN 从 01）和 ${TASKS_DIR}/README.md。
+每个 task 文件格式同之前标准（frontmatter + 范围 + 验证标准 + 依赖）。"
+        cli_call "$ML_SPLIT_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+
+        # 重新逐任务开发（L 级参数）
+        use_model_code  # 开发阶段切回编码模型
+        echo "  [M→L] 以 L 级参数重新开发所有任务..."
+        ML_TASK_FILES=$(ls "$TASKS_DIR"/task-*.md 2>/dev/null | sort)
+        ML_COMPLETED=0
+        ML_FAILED=0
+        for ML_TASK_FILE in $ML_TASK_FILES; do
+            ML_TASK_BASENAME=$(basename "$ML_TASK_FILE" .md)
+            ML_TASK_NAME=$(grep "^name:" "$ML_TASK_FILE" | sed 's/^name: *//' || echo "$ML_TASK_BASENAME")
+            ML_PRE_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+            ML_DEV_EXIT=0
+            bash .claude/scripts/feature-develop-loop.sh "$VERSION_ID" "$FEATURE_NAME" --task "$ML_TASK_FILE" "$DEV_MAX_ROUNDS" || ML_DEV_EXIT=$?
+            ML_POST_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+            if [ "$ML_DEV_EXIT" -eq 0 ]; then
+                if [ "$ML_POST_HEAD" = "$ML_PRE_HEAD" ]; then
+                    git add -u 2>/dev/null || true
+                    git reset HEAD -- '*.env' '*credentials*' 2>/dev/null || true
+                    git commit -m "feat(${FEATURE_NAME}): ${ML_TASK_NAME} [M→L升级]
+
+任务 ${ML_TASK_BASENAME} 版本：${VERSION_ID}（M→L 自动升级）
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>" 2>/dev/null || true
+                fi
+                sed -i "s/status: pending/status: completed/" "$ML_TASK_FILE" 2>/dev/null || true
+                ML_COMPLETED=$((ML_COMPLETED + 1))
+            else
+                sed -i "s/status: pending/status: failed/" "$ML_TASK_FILE" 2>/dev/null || true
+                ML_FAILED=$((ML_FAILED + 1))
+            fi
+        done
+        COMPLETED_TASKS=$ML_COMPLETED
+        FAILED_TASKS=$ML_FAILED
+        TOTAL_TASKS=$(echo "$ML_TASK_FILES" | wc -l)
+        echo "| M→L 重新开发 | 完成 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 成功=${ML_COMPLETED} 失败=${ML_FAILED} |" >> "$WORK_LOG"
+    else
+        echo "[M级] 开发失败但未检测到达轮次上限，不触发 M→L 升级"
+        echo "| M级告警 | 失败非上限 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 需人工检查 |" >> "$WORK_LOG"
+    fi
+fi
+
+# L 级失败告警（不触发升级，已达最高级别）
+if [ "$COMPLEXITY" = "L" ] && [ "$FAILED_TASKS" -gt 0 ]; then
+    echo "WARNING: L 级开发 ${FAILED_TASKS} 个任务失败，已达最高级别，不再升级"
+    echo "| L级告警 | 部分失败 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | ${FAILED_TASKS} 个任务失败，需人工介入 |" >> "$WORK_LOG"
+fi
+
+fi  # end: if [ "$S_TRACK_DONE" != "true" ]
+
+# ══════════════════════════════════════
+# 阶段四-B：Task Guardian 任务完成度守卫
+# ══════════════════════════════════════
+
+if [ "$COMPLEXITY" != "S" ] && [ "$S_TRACK_DONE" != "true" ] && [ "$COMPLETED_TASKS" -gt 0 ]; then
+    mark_stage "task-guardian"
+    GUARDIAN_START=$(date +%s)
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  阶段四-B：Task Guardian 任务完成度守卫"
+    echo "══════════════════════════════════════"
+
+    # 收集所有 task-*.md 中的 verify_commands
+    TIMEOUT_VERIFY_SECTION=""
+    for _tfile in "${TASKS_DIR}"/task-*.md; do
+        if [ -f "$_tfile" ]; then
+            _cmds=$(sed -n '/^verify_commands:/,/^[^[:space:]]/p' "$_tfile" | grep '^\s*-\s*"' | sed 's/^\s*-\s*"\(.*\)"//' || true)
+            while IFS= read -r _vcmd; do
+                [ -z "$_vcmd" ] && continue
+                TIMEOUT_VERIFY_SECTION="${TIMEOUT_VERIFY_SECTION}  - timeout 60s ${_vcmd}
+"
+            done <<< "$_cmds"
+        fi
+    done
+
+    # 读取 tasks/README.md
+    README_CONTENT=""
+    [ -f "${TASKS_DIR}/README.md" ] && README_CONTENT=$(cat "${TASKS_DIR}/README.md")
+
+    GUARDIAN_REPORT="${FEATURE_DIR}/task-guardian-report.md"
+
+    GUARDIAN_PROMPT="你是一名严格的质量审计员。请审计以下功能的任务完成情况。
+
+## 任务列表（tasks/README.md）
+
+${README_CONTENT}
+
+## 审计指令
+
+1. 读取 ${TASKS_DIR}/ 下所有 task-*.md 文件
+2. 执行 git log --oneline -20 查看最近提交
+3. 执行 git diff ${PRE_DEV_HEAD_ALL}..HEAD --stat 查看本次开发实际变更文件列表
+4. 对每个 task-*.md 文件，检查：
+   a. status 字段是否为 completed
+   b. git log 中是否有对应 commit
+   c. 计划修改的文件是否在 git diff 中出现
+5. 执行以下 verify_commands（每条使用 timeout 60s 包装）：
+${TIMEOUT_VERIFY_SECTION}
+6. 输出报告到 ${GUARDIAN_REPORT}，包含：
+   - 完成率（已完成/总任务数）
+   - 已完成任务列表
+   - 未完成任务列表（含原因）
+   - 遗漏功能点
+7. 报告最后一行必须且只能输出以下之一：
+   ALL_TASKS_COMPLETE
+   REMEDIATION_NEEDED: task-NN
+   MANUAL_INTERVENTION_NEEDED"
+
+    echo "  [Guardian] 执行任务完成度审计..."
+    cli_call "$GUARDIAN_PROMPT" --permission-mode bypassPermissions > "$GUARDIAN_REPORT" 2>&1 || true
+
+    # 解析 Guardian 结果
+    GUARDIAN_STATUS="UNKNOWN"
+    if [ -f "$GUARDIAN_REPORT" ]; then
+        LAST_LINES=$(tail -5 "$GUARDIAN_REPORT" 2>/dev/null || echo "")
+        if echo "$LAST_LINES" | grep -q "ALL_TASKS_COMPLETE"; then
+            GUARDIAN_STATUS="ALL_TASKS_COMPLETE"
+        elif echo "$LAST_LINES" | grep -q "REMEDIATION_NEEDED"; then
+            GUARDIAN_STATUS="REMEDIATION_NEEDED"
+        elif echo "$LAST_LINES" | grep -q "MANUAL_INTERVENTION_NEEDED"; then
+            GUARDIAN_STATUS="MANUAL_INTERVENTION_NEEDED"
+        fi
+    fi
+
+    echo "  [Guardian] 审计结果: ${GUARDIAN_STATUS}"
+    echo "| Task Guardian | ${GUARDIAN_STATUS} | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 完成率见 task-guardian-report.md |" >> "$WORK_LOG"
+
+    # 补救流程：未完成任务 ≤2 自动补救，>2 记录告警
+    # 审计用轻量模型已完成，补救需要编码模型
+    if [ "$GUARDIAN_STATUS" = "REMEDIATION_NEEDED" ] && [ -f "$GUARDIAN_REPORT" ]; then
+        # 统计报告中出现的 REMEDIATION_NEEDED 行数
+        REMEDIATION_COUNT=$(grep -c "REMEDIATION_NEEDED" "$GUARDIAN_REPORT" 2>/dev/null || true)
+        REMEDIATION_COUNT=$(echo "$REMEDIATION_COUNT" | tail -1 | tr -d '\r')
+        REMEDIATION_COUNT=${REMEDIATION_COUNT:-1}
+        # 从报告中收集未完成任务编号
+        INCOMPLETE_TASKS=$(grep -oE "task-[0-9]+" "$GUARDIAN_REPORT" 2>/dev/null | sort -u || echo "")
+
+        if [ "$REMEDIATION_COUNT" -le 2 ]; then
+            use_model_code  # 补救需要编码模型
+            echo "  [Guardian] 发现 ${REMEDIATION_COUNT} 个未完成任务，启动自动补救..."
+            for _rt in $INCOMPLETE_TASKS; do
+                _rt_file="${TASKS_DIR}/${_rt}.md"
+                if [ -f "$_rt_file" ] && ! grep -qE "status: (completed|done)" "$_rt_file" 2>/dev/null; then
+                    echo "  [Guardian] 补救任务: ${_rt}..."
+                    REMEDIATION_EXIT=0
+                    bash .claude/scripts/feature-develop-loop.sh "$VERSION_ID" "$FEATURE_NAME" --task "$_rt_file" "$DEV_MAX_ROUNDS" || REMEDIATION_EXIT=$?
+                    if [ "$REMEDIATION_EXIT" -eq 0 ]; then
+                        COMPLETED_TASKS=$((COMPLETED_TASKS + 1))
+                        echo "  [Guardian] 补救成功: ${_rt}"
+                        echo "| Guardian补救 | 成功 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | ${_rt} 补救完成 |" >> "$WORK_LOG"
+                    else
+                        echo "  [Guardian] 补救失败: ${_rt}"
+                        echo "| Guardian补救 | 失败 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | ${_rt} 补救失败 |" >> "$WORK_LOG"
+                    fi
+                fi
+            done
+        else
+            echo "  [Guardian] 未完成任务数 ${REMEDIATION_COUNT} > 2，记录告警，不自动补救"
+            echo "| Guardian告警 | 超过补救上限 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | ${REMEDIATION_COUNT} 个任务未完成，超过自动补救上限 2 |" >> "$WORK_LOG"
+        fi
+    elif [ "$GUARDIAN_STATUS" = "MANUAL_INTERVENTION_NEEDED" ]; then
+        echo "  [Guardian] 检测到需人工介入的问题，记录告警"
+        echo "| Guardian告警 | 需人工介入 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 详情见 task-guardian-report.md |" >> "$WORK_LOG"
+    fi
+
+    GUARDIAN_END=$(date +%s)
+    GUARDIAN_DURATION=$((GUARDIAN_END - GUARDIAN_START))
+    echo "| Task Guardian 耗时 | 完成 | - | $(date '+%H:%M:%S') | ${GUARDIAN_DURATION}s | ${CLI_CALL_COUNT} | - |" >> "$WORK_LOG"
+fi
+
+# ══════════════════════════════════════
+# 阶段四-C：验收门禁（Acceptance Gate）
+# ══════════════════════════════════════
+# 回读 feature.md 的每条 REQ 及验收条件，逐条验证：
+#   代码是否存在、配置是否到位、测试是否覆盖、冒烟测试是否通过
+# 只有全部 REQ PASS 才允许进入阶段五，否则触发补救或告警
+
+ACCEPTANCE_PASSED=false
+ACCEPTANCE_DURATION=0
+
+use_model_light  # 验收/文档阶段切回轻量模型
+
+if [ "$COMPLETED_TASKS" -gt 0 ]; then
+    mark_stage "acceptance"
+    ACCEPT_START=$(date +%s)
+    ACCEPT_START_FMT=$(date '+%H:%M:%S')
+    echo ""
+    echo "══════════════════════════════════════"
+    echo "  阶段四-C：验收门禁（Acceptance Gate）"
+    echo "══════════════════════════════════════"
+
+    # 确定 feature 文件
+    ACCEPT_FEATURE_FILE="${FEATURE_DIR}/feature.md"
+    if [ ! -f "$ACCEPT_FEATURE_FILE" ]; then
+        ACCEPT_FEATURE_FILE="${FEATURE_DIR}/feature.json"
+    fi
+
+    ACCEPTANCE_REPORT="${FEATURE_DIR}/acceptance-report.md"
+
+    # 生成压缩验收输入
+    ACCEPT_INPUT=$(generate_acceptance_review_input "${PRE_DEV_HEAD_ALL:-HEAD~10}")
+
+    ACCEPT_PROMPT="你是 Codex，职责是作为独立审查者执行最终验收。Claude 负责实现，你负责找出未被实现、实现不完整、测试不足和上线风险。
+
+读取 .ai/context/reviewer-brief.md 了解审查硬约束。
+读取 ${ACCEPT_INPUT} 了解验收输入摘要（REQ 列表、任务完成情况、变更概览）。
+
+## 输入
+
+1. 需求文档：${ACCEPT_FEATURE_FILE}
+2. 技术方案：${FEATURE_DIR}/plan.md（如存在）
+3. 验收输入摘要：${ACCEPT_INPUT}
+4. 实际代码变更：git diff ${PRE_DEV_HEAD_ALL:-HEAD~10}..HEAD
+
+## 验收流程
+
+### 第一步：提取需求清单
+读取 ${ACCEPT_FEATURE_FILE}，提取所有 REQ-NNN 条目及其验收条件。
+如果 feature 文件不存在（S 级通道），则基于 git diff 推断本次变更的功能点作为验收项。
+
+### 第二步：逐条验证每个 REQ
+对每条需求，按以下 4 个维度验证，全部通过才算该 REQ PASS：
+
+#### 2a. 代码实现验证
+- grep/搜索验收条件中提到的关键函数、接口、路由是否存在于代码中
+- 检查 git diff 中是否包含对应文件的变更
+
+#### 2b. 配置完整性验证
+- 如果需求涉及新的配置项，检查 config.example.yaml / .env.example 是否已更新
+- 如果涉及新的环境变量，检查是否有文档说明
+- 如果涉及新的 Docker 服务，检查 docker-compose 是否已更新
+
+#### 2c. 测试覆盖验证
+- 检查新增/修改的核心函数是否有对应测试
+- 如果新增了 HTTP 端点，验证 router_test.go 和 smoke/*.hurl 是否存在对应测试（宪法 2.4）
+- 运行相关测试确认通过：
+  - Go: cd Backend && go test -short -count=1 ./涉及的包/...
+  - TS: cd MCP && npx tsc --noEmit（如涉及 MCP）
+  - TS: cd Frontend && npx tsc --noEmit（如涉及 Frontend）
+
+#### 2d. 冒烟可达性验证（最佳努力）
+- 如果 Backend/tests/smoke/ 下有对应 .hurl 文件，尝试用 hurl --test 运行
+- 如果无法运行（服务未启动等），标记为 SKIP 而非 FAIL
+
+### 第三步：输出验收报告
+将报告写入 ${ACCEPTANCE_REPORT}，格式：
+
+\`\`\`markdown
+# 验收报告
+
+## 总览
+- 验收时间: YYYY-MM-DD HH:MM:SS
+- 需求总数: N
+- 通过: N
+- 失败: N
+- 跳过: N
+
+## 逐条验收结果
+
+### REQ-001: {标题} — PASS ✓ / FAIL ✗
+| 维度 | 结果 | 详情 |
+|------|------|------|
+| 代码实现 | PASS/FAIL | 说明 |
+| 配置完整 | PASS/FAIL/N/A | 说明 |
+| 测试覆盖 | PASS/FAIL | 说明 |
+| 冒烟验证 | PASS/SKIP | 说明 |
+
+### REQ-002: ...
+（同上）
+
+## 未覆盖的验收条件
+- 列出所有未通过的验收条件及原因
+
+## Context Repairs
+- **类型**: shared-context | constitution | command | skill | rule
+- **目标文件**: .ai/context/project.md / .ai/constitution.md / .claude/commands/... / .claude/skills/... / .claude/rules/...
+- **问题**: Claude 缺了什么上下文，导致验收阶段暴露出系统性遗漏
+- **建议补充**: 应沉淀的规则、边界条件、测试要求或项目模式
+- **触发条件**: 为什么这是长期规则缺口，而不是本次单点缺陷
+
+## 结论
+\`\`\`
+
+### 第四步：输出终态判定
+报告最后一行必须且只能输出以下之一：
+- ALL_REQ_ACCEPTED — 所有 REQ 全部通过（SKIP 不算失败）
+- REMEDIATION_NEEDED: REQ-NNN, REQ-MMM — 列出失败的 REQ 编号
+- CANNOT_VERIFY — 无法执行验证（如 feature 文件缺失且无法推断）
+
+规则：
+- P0 需求（[P0] 标记）必须全部 PASS，任何 P0 失败即整体 FAIL
+- P1 需求允许最多 1 条 FAIL（记录为已知限制）
+- P2 需求 FAIL 不阻塞，但必须记录
+- 这是独立验收，不要假设 Claude 之前的结论是对的
+- 优先识别：需求遗漏、边界未覆盖、测试虚假通过、配置缺失、回归风险
+- 必须输出 Context Repairs；如果无则写 - 无
+- 直接执行，不要向用户提问"
+
+    echo "  [Acceptance] 执行需求级验收..."
+        # 根据风险信号选择单路或并行 review
+        ACCEPT_CHANGE_METRICS=$(count_changes "${PRE_DEV_HEAD_ALL:-HEAD~10}")
+        ACCEPT_CHANGED_DIRS=$(echo "$ACCEPT_CHANGE_METRICS" | cut -d: -f1)
+        ACCEPT_CHANGED_FILES=$(echo "$ACCEPT_CHANGE_METRICS" | cut -d: -f2)
+        ACCEPT_REVIEW_MODE=$(should_acceptance_use_parallel "$COMPLEXITY" "$ACCEPT_CHANGED_DIRS" "$ACCEPT_CHANGED_FILES")
+        echo "  Acceptance review mode: ${ACCEPT_REVIEW_MODE} (dirs=${ACCEPT_CHANGED_DIRS} files=${ACCEPT_CHANGED_FILES})"
+
+        if [ "$ACCEPT_REVIEW_MODE" = "parallel" ]; then
+            run_parallel_acceptance_reviews "$ACCEPT_PROMPT" "$ACCEPTANCE_REPORT"
+        else
+            run_single_acceptance_review "$ACCEPT_PROMPT" "$ACCEPTANCE_REPORT"
+        fi
+        # Acceptance 阶段始终触发 context repair（如有实质内容）
+        apply_context_repairs "$ACCEPTANCE_REPORT" "$FEATURE_DIR"
+
+    # 解析验收结果
+    ACCEPT_STATUS="UNKNOWN"
+    if [ -f "$ACCEPTANCE_REPORT" ]; then
+        ACCEPT_LAST=$(tail -5 "$ACCEPTANCE_REPORT" 2>/dev/null || echo "")
+        if echo "$ACCEPT_LAST" | grep -q "ALL_REQ_ACCEPTED"; then
+            ACCEPT_STATUS="ALL_REQ_ACCEPTED"
+            ACCEPTANCE_PASSED=true
+        elif echo "$ACCEPT_LAST" | grep -q "REMEDIATION_NEEDED"; then
+            ACCEPT_STATUS="REMEDIATION_NEEDED"
+            # 提取失败的 REQ 编号
+            FAILED_REQS=$(echo "$ACCEPT_LAST" | grep -oE "REQ-[0-9]+" | tr '\n' ' ' || true)
+        elif echo "$ACCEPT_LAST" | grep -q "CANNOT_VERIFY"; then
+            ACCEPT_STATUS="CANNOT_VERIFY"
+            ACCEPTANCE_PASSED=true  # 无法验证时不阻塞（S 级等场景）
+        fi
+    else
+        echo "WARNING: 验收报告未生成"
+        ACCEPT_STATUS="REPORT_MISSING"
+    fi
+
+    echo "  [Acceptance] 验收结果: ${ACCEPT_STATUS}"
+    echo "| 验收门禁 | ${ACCEPT_STATUS} | ${ACCEPT_START_FMT} | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 详情见 acceptance-report.md |" >> "$WORK_LOG"
+
+    # ── 验收补救流程 ──
+    if [ "$ACCEPT_STATUS" = "REMEDIATION_NEEDED" ] && [ -n "${FAILED_REQS:-}" ]; then
+        use_model_code  # 验收补救需要编码模型
+        echo "  [Acceptance] 失败需求: ${FAILED_REQS}"
+        echo "  [Acceptance] 启动验收补救（最多 1 轮）..."
+
+        ACCEPT_FIX_PROMPT="你是一名资深全栈工程师。验收门禁发现以下需求未通过，请修复。
+
+## 失败需求
+${FAILED_REQS}
+
+## 验收报告
+请读取 ${ACCEPTANCE_REPORT} 了解每条需求的失败原因。
+
+## 修复指令
+1. 读取验收报告，定位每个 FAIL 的具体原因
+2. 逐个修复：
+   - 代码实现缺失 → 补充实现
+   - 配置未更新 → 更新配置文件
+   - 测试未覆盖 → 补充测试
+   - 冒烟测试失败 → 修复端点或添加 hurl 文件
+3. 修复后确保编译通过：
+   - Go: cd Backend && go build ./...
+   - TS: cd Frontend && npx tsc --noEmit（如涉及）
+   - TS: cd MCP && npx tsc --noEmit（如涉及）
+4. 运行相关测试确认通过
+5. 使用 git add + git commit 提交修复
+
+规则：
+- 只修复验收报告中指出的问题，不做额外改动
+- 不要向用户提问，直接修复"
+
+        cli_call "$ACCEPT_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+
+        # ── 补救后重新验收 ──
+        echo "  [Acceptance] 补救后重新验收..."
+        # 重新生成验收输入（补救后代码已变更）
+        REACCEPT_INPUT=$(generate_acceptance_review_input "${PRE_DEV_HEAD_ALL:-HEAD~10}")
+        REACCEPT_PROMPT="你是 Codex，职责是对 Claude 补救后的结果重新验收。
+
+读取 .ai/context/reviewer-brief.md 了解审查硬约束。
+读取 ${REACCEPT_INPUT} 了解验收输入摘要（REQ 列表、任务完成情况、变更概览）。
+
+请重新读取 ${ACCEPT_FEATURE_FILE} 和最新代码，按照与首次验收完全相同的流程重新验证所有 REQ。
+将新报告**覆盖写入** ${ACCEPTANCE_REPORT}。
+
+报告最后一行输出：ALL_REQ_ACCEPTED 或 FINAL_FAIL: REQ-NNN, REQ-MMM
+
+规则：不要向用户提问，直接验证。"
+
+        codex_review_exec "$REACCEPT_PROMPT" 2>&1 | tail -20 || true
+        apply_context_repairs "$ACCEPTANCE_REPORT" "$FEATURE_DIR"
+
+        # 解析重新验收结果
+        if [ -f "$ACCEPTANCE_REPORT" ]; then
+            REACCEPT_LAST=$(tail -5 "$ACCEPTANCE_REPORT" 2>/dev/null || echo "")
+            if echo "$REACCEPT_LAST" | grep -q "ALL_REQ_ACCEPTED"; then
+                ACCEPT_STATUS="ALL_REQ_ACCEPTED (补救后通过)"
+                ACCEPTANCE_PASSED=true
+            else
+                ACCEPT_STATUS="FINAL_FAIL (补救后仍未通过)"
+                ACCEPTANCE_PASSED=false
+            fi
+        fi
+        echo "  [Acceptance] 补救后结果: ${ACCEPT_STATUS}"
+        echo "| 验收补救 | ${ACCEPT_STATUS} | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | - |" >> "$WORK_LOG"
+    fi
+
+    ACCEPT_END=$(date +%s)
+    ACCEPTANCE_DURATION=$((ACCEPT_END - ACCEPT_START))
+    echo "| 验收门禁耗时 | 完成 | - | $(date '+%H:%M:%S') | ${ACCEPTANCE_DURATION}s | ${CLI_CALL_COUNT} | ${ACCEPT_STATUS} |" >> "$WORK_LOG"
+
+    if [ "$ACCEPTANCE_PASSED" = "true" ]; then
+        echo "验收门禁通过 ✓ (${ACCEPTANCE_DURATION}s)"
+    else
+        echo "WARNING: 验收门禁未通过，功能未达到上线标准"
+        echo "| 验收告警 | 未通过 | - | $(date '+%H:%M:%S') | - | ${CLI_CALL_COUNT} | 需人工介入，详情见 acceptance-report.md |" >> "$WORK_LOG"
+    fi
+else
+    echo "无成功完成的任务，跳过验收门禁"
+    ACCEPTANCE_PASSED=false
+fi
+
+
+# ══════════════════════════════════════
+# 阶段五：生成模块文档（仅验收通过时执行）
+# ══════════════════════════════════════
+
+use_model_light  # 文档阶段显式切回轻量模型（不依赖上游状态）
+mark_stage "doc-gen"
+STAGE5_START=$(date +%s)
+STAGE5_START_FMT=$(date '+%H:%M:%S')
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段五：生成模块文档"
+echo "══════════════════════════════════════"
+
+# 仅在验收通过且有成功完成的任务时才生成文档
+if [ "$ACCEPTANCE_PASSED" = "true" ] && [ "$COMPLETED_TASKS" -gt 0 ]; then
+    # 确定 feature 文件
+    FEATURE_FILE="${FEATURE_DIR}/feature.md"
+    if [ ! -f "$FEATURE_FILE" ]; then
+        FEATURE_FILE="${FEATURE_DIR}/feature.json"
+    fi
+
+    # 确定 plan 文件
+    PLAN_PATH="${FEATURE_DIR}/plan.md"
+    if [ ! -f "$PLAN_PATH" ]; then
+        PLAN_PATH="${FEATURE_DIR}/plan.json"
+    fi
+
+    DOC_PROMPT="你是一名资深文档工程师。请为刚完成的功能生成/更新模块文档，归档到 Docs/Engine/ 目录下。
+
+请读取以下文件建立上下文：
+1. ${FEATURE_FILE} — 功能需求
+2. ${PLAN_PATH} — 技术方案
+3. 浏览 ${TASKS_DIR}/ 下的任务文件了解实现范围
+4. 阅读实际修改的代码文件，理解最终实现
+
+然后执行以下步骤：
+
+### 步骤一：确定模块归属
+- 根据功能涉及的领域，确定归属到 Docs/Engine/ 下的哪个模块目录
+- 查看 Docs/Engine/ 已有的目录列表，优先归入已有模块
+- 如果是全新领域，创建新的模块目录
+
+### 步骤二：生成/更新文档
+- 如果该模块目录下已有文档，以**追加或更新**方式整合新内容
+- 如果是全新模块，创建主文档
+
+文档格式：
+
+\`\`\`markdown
+# {系统名称}
+
+## 概述
+系统的整体目标和职责范围。
+
+## 架构设计
+关键模块和职责。
+
+## 核心流程
+关键业务流程。
+
+## 关键文件索引
+| 职责 | 文件路径 |
+|------|----------|
+
+## 注意事项
+开发时需要注意的坑和约束。
+\`\`\`
+
+规则：
+- 文档内容必须基于实际代码，不要编造不存在的文件路径
+- 重点记录架构决策和关键流程
+- 注释和文档用中文
+- 直接写文件，不要向用户提问"
+
+    cli_call "$DOC_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
+    DOC_EXIT=$?
+
+    STAGE5_END=$(date +%s)
+    STAGE5_DURATION=$((STAGE5_END - STAGE5_START))
+
+    if [ $DOC_EXIT -eq 0 ]; then
+        STAGE5_END_FMT=$(date '+%H:%M:%S')
+        DOC_DURATION=$STAGE5_DURATION
+        echo "| 生成模块文档 | 完成 | ${STAGE5_START_FMT} | ${STAGE5_END_FMT} | ${STAGE5_DURATION}s | ${CLI_CALL_COUNT} | Docs/Engine/ |" >> "$WORK_LOG"
+        echo "模块文档生成完成 (${STAGE5_DURATION}s)"
+
+        # 提交文档到 Git
+        DOC_COMMIT_PROMPT="请执行以下步骤提交文档变更：
+
+1. 运行 git status 查看 Docs/Engine/ 下的变更
+2. 如果有变更，用 git add 添加 Docs/Engine/ 下的所有变更文件
+3. 提交：
+
+git commit -m \"\$(cat <<'COMMITEOF'
+docs(${FEATURE_NAME}): 更新模块文档
+
+将 ${VERSION_ID}/${FEATURE_NAME} 的实现总结归档到 Docs/Engine/
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+COMMITEOF
+)\"
+
+4. 如果没有变更，输出 'NO_CHANGES'
+5. 如果 commit 成功，输出 'COMMIT_SUCCESS'"
+
+        DOC_COMMIT_RESULT=$(cli_call "$DOC_COMMIT_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10)
+        echo "$DOC_COMMIT_RESULT"
+    else
+        echo "WARNING: 模块文档生成异常 (exit=$DOC_EXIT)"
+        STAGE5_END_FMT=$(date '+%H:%M:%S')
+        echo "| 生成模块文档 | 异常 | ${STAGE5_START_FMT} | ${STAGE5_END_FMT} | ${STAGE5_DURATION:-0}s | ${CLI_CALL_COUNT} | exit=$DOC_EXIT |" >> "$WORK_LOG"
+    fi
+else
+    if [ "$ACCEPTANCE_PASSED" != "true" ]; then
+        echo "验收门禁未通过，跳过文档生成（功能未达到上线标准）"
+        echo "| 生成模块文档 | 跳过 | ${STAGE5_START_FMT} | ${STAGE5_START_FMT} | 0s | 0 | 验收未通过 |" >> "$WORK_LOG"
+    else
+        echo "无成功完成的任务，跳过文档生成"
+        echo "| 生成模块文档 | 跳过 | ${STAGE5_START_FMT} | ${STAGE5_START_FMT} | 0s | 0 | 无成功任务 |" >> "$WORK_LOG"
+    fi
+fi
+
+# ══════════════════════════════════════
+# 阶段六：推送到远程仓库
+# ══════════════════════════════════════
+
+mark_stage "git-push"
+STAGE6_START=$(date +%s)
+STAGE6_START_FMT=$(date '+%H:%M:%S')
+echo ""
+echo "══════════════════════════════════════"
+echo "  阶段六：推送到远程仓库"
+echo "══════════════════════════════════════"
+
+if [ "$ACCEPTANCE_PASSED" = "true" ] && [ "$COMPLETED_TASKS" -gt 0 ]; then
+    PUSH_PROMPT="请将当前仓库的当前分支推送到远程仓库。
+
+操作步骤：
+1. 运行 git status 检查状态
+2. 运行 git log --oneline origin/\$(git branch --show-current)..HEAD 2>/dev/null 检查是否有新 commit
+3. 如果有新 commit 需要推送：
+   - 如果当前分支已有远程追踪分支 → git push
+   - 如果没有远程追踪分支 → git push -u origin <当前分支名>
+4. 如果没有新 commit，跳过推送
+
+规则：
+- 禁止 git push --force 或 git push -f
+- 如果推送失败（rejected），输出错误信息但不要 force push"
+
+    PUSH_RESULT=$(cli_call "$PUSH_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20)
+    echo "$PUSH_RESULT"
+
+    STAGE6_END=$(date +%s)
+    STAGE6_END_FMT=$(date '+%H:%M:%S')
+    STAGE6_DURATION=$((STAGE6_END - STAGE6_START))
+    PUSH_DURATION=$STAGE6_DURATION
+    echo "| 推送远程仓库 | 完成 | ${STAGE6_START_FMT} | ${STAGE6_END_FMT} | ${STAGE6_DURATION}s | ${CLI_CALL_COUNT} | - |" >> "$WORK_LOG"
+    echo "推送完成 (${STAGE6_DURATION}s)"
+elif [ "$ACCEPTANCE_PASSED" != "true" ]; then
+    echo "验收门禁未通过，跳过推送（功能未达到上线标准）"
+    echo "| 推送远程仓库 | 跳过 | ${STAGE6_START_FMT} | ${STAGE6_START_FMT} | 0s | 0 | 验收未通过 |" >> "$WORK_LOG"
+else
+    echo "无成功完成的任务，跳过推送"
+    echo "| 推送远程仓库 | 跳过 | ${STAGE6_START_FMT} | ${STAGE6_START_FMT} | 0s | 0 | 无成功任务 |" >> "$WORK_LOG"
+fi
+
+# ══════════════════════════════════════
+# 总结
+# ══════════════════════════════════════
+
+TOTAL_END=$(date +%s)
+TOTAL_DURATION=$((TOTAL_END - STAGE0_START))
+
+cat >> "$WORK_LOG" << EOF
+
+## 总结
+- **总耗时**: ${TOTAL_DURATION}s
+- **完成时间**: $(date '+%Y-%m-%d %H:%M:%S')
+- **任务统计**: 总计 ${TOTAL_TASKS} 个，成功 ${COMPLETED_TASKS} 个，失败 ${FAILED_TASKS} 个
+- **验收状态**: ${ACCEPTANCE_PASSED} (${ACCEPT_STATUS:-未执行})
+- **上线就绪**: $([ "$ACCEPTANCE_PASSED" = "true" ] && echo "是" || echo "否 — 需人工介入")
+- **产出文件**:
+  - 需求文档: ${FEATURE_DIR}/feature.md
+  - 技术方案: ${FEATURE_DIR}/plan.md
+  - 任务清单: ${TASKS_DIR}/README.md
+  - 开发日志: ${FEATURE_DIR}/develop-log.md
+  - 验收报告: ${FEATURE_DIR}/acceptance-report.md
+  - Plan 迭代日志: ${FEATURE_DIR}/plan-iteration-log.md
+  - Develop 迭代日志: ${FEATURE_DIR}/develop-iteration-log.md
+  - 模块文档: Docs/Engine/
+EOF
+
+# ── 汇总统计（阶段六之后追加）──
+OTHER_DURATION=$((GUARDIAN_DURATION + ACCEPTANCE_DURATION + DOC_DURATION + PUSH_DURATION))
+if [ "$TOTAL_DURATION" -gt 0 ]; then
+    CLASSIFY_PCT=$((CLASSIFY_DURATION * 100 / TOTAL_DURATION))
+    PLAN_PCT=$((PLAN_DURATION * 100 / TOTAL_DURATION))
+    DEV_PCT=$((DEV_DURATION * 100 / TOTAL_DURATION))
+    OTHER_PCT=$((OTHER_DURATION * 100 / TOTAL_DURATION))
+else
+    CLASSIFY_PCT=0
+    PLAN_PCT=0
+    DEV_PCT=0
+    OTHER_PCT=0
+fi
+
+cat >> "$WORK_LOG" << EOF
+
+## 汇总统计
+
+| 指标 | 值 |
+|------|-----|
+| 总耗时 | ${TOTAL_DURATION}s ($(format_duration $TOTAL_DURATION)) |
+| 分类+调研 | ${CLASSIFY_DURATION}s (${CLASSIFY_PCT}%) |
+| 方案设计 | ${PLAN_DURATION}s (${PLAN_PCT}%) |
+| 开发+验证 | ${DEV_DURATION}s (${DEV_PCT}%) |
+| 守卫+文档+推送 | ${OTHER_DURATION}s (${OTHER_PCT}%) |
+| CLI 进程总数 | ${CLI_CALL_COUNT} |
+| 升级次数 | ${UPGRADE_COUNT} |
+EOF
+
+echo ""
+echo "══════════════════════════════════════"
+echo "  Auto-Work 全流程完成"
+echo "══════════════════════════════════════"
+echo "  功能: ${VERSION_ID}/${FEATURE_NAME}"
+echo "  总耗时: ${TOTAL_DURATION}s"
+echo "  任务: 成功=${COMPLETED_TASKS} 失败=${FAILED_TASKS} / 总计=${TOTAL_TASKS}"
+echo "  工作目录: ${FEATURE_DIR}/"
+echo "  总日志: ${WORK_LOG}"
+[ -n "$UPGRADED_FROM" ] && echo "  ↑ 升级链: ${UPGRADED_FROM}→${COMPLEXITY}（共升级 ${UPGRADE_COUNT} 次）"
+echo "══════════════════════════════════════"
