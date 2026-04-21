@@ -1,268 +1,270 @@
 # AI Auto-Coding Workflow
 
-基于 Claude Code + Codex 的全链路 AI 开发工作流体系，覆盖从需求研究到代码提交的完整流程。
+> 中文文档请点击查看：[README_CN.md](./README_CN.md)
+
+A full-cycle AI development workflow system built on Claude Code + Codex, covering everything from requirement research to code commit.
 
 ---
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 全自动完成一个需求
-/auto-work 实现用户头像上传功能
+# Fully automated requirement implementation
+/auto-work implement user avatar upload feature
 
-# 带人工检查点
-/manual-work 重构用户认证模块
+# With manual checkpoints
+/manual-work refactor user authentication module
 
-# 仅生成方案，待确认后再开发
-/feature:plan 添加 WebSocket 实时推送
+# Generate plan only, develop after confirmation
+/feature:plan add WebSocket real-time push
 
-# 技术选型调研
-/research:do 评估 Redis Streams vs Kafka 用于任务队列
+# Technology selection research
+/research:do evaluate Redis Streams vs Kafka for task queue
 
-# 修复 Bug
-/bug:fix 修复并发场景下的内存泄漏
+# Bug fix
+/bug:fix fix memory leak in concurrent scenarios
 ```
 
 ---
 
-## AI 工作流体系
+## AI Workflow System
 
-本仓库内置一套完整的 AI 开发工作流，覆盖从需求研究到代码提交的全链路。所有工作流由 Claude Code 驱动，Codex 承担对抗审查角色。
+This repository contains a complete AI development workflow covering the full cycle from requirement research to code commit. All workflows are driven by Claude Code, with Codex serving as the adversarial reviewer.
 
-### 执行模式
+### Execution Modes
 
-| 模式 | 触发条件 | 执行方式 | 审查质量 |
-|------|----------|----------|----------|
-| **ROUTE_MODE_A** | claude CLI + codex CLI 均可用 | Bash 子进程编排 | 最高（跨模型审查） |
-| **ROUTE_MODE_B** | 仅 Agent 工具可用 | Agent 委托编排 | 良好（Agent 代理审查） |
+| Mode | Trigger | Execution | Review Quality |
+|------|---------|-----------|----------------|
+| **ROUTE_MODE_A** | Both claude CLI + codex CLI available | Bash subprocess orchestration | Highest (cross-model review) |
+| **ROUTE_MODE_B** | Agent tool only | Agent delegation orchestration | Good (Agent proxy review) |
 
 ---
 
-### `/auto-work` — 全自动工作流
+### `/auto-work` — Fully Automated Workflow
 
-无需人工干预，从需求到代码提交全自动完成。
+No human intervention required. Fully automated from requirement to code commit.
 
-**阶段：**
+**Stages:**
 
-1. **需求分级** — 按复杂度分为 S / M / L 三档，L 级自动拆分为多个 M 级任务
-2. **技术调研**（按需）— 调用 `/research:loop` 完成技术选型
-3. **方案生成** — 调用 `/feature:plan` 迭代生成 `plan.md`
-4. **任务拆解** — 将 plan 拆为原子粒度的 `tasks/task-N.md`（≤3 文件 / ≤100 行）
-5. **开发循环** — 调用 `/feature:develop` 编码 + 审查迭代
-6. **验收门禁** — 强制编译 + 测试通过，HTTP 端点三件套（路由注册 + 路由测试 + smoke）
-7. **归档更新** — 更新架构文档 / 版本文档
-8. **提交推送** — 调用 `/git:commit` + `/git:push`
+1. **Requirement Classification** — Classified into S / M / L by complexity; L-level tasks are automatically split into multiple M-level tasks
+2. **Technical Research** (on demand) — Calls `/research:loop` for technology selection
+3. **Plan Generation** — Calls `/feature:plan` to iteratively generate `plan.md`
+4. **Task Decomposition** — Splits plan into atomic `tasks/task-N.md` (≤3 files / ≤100 lines each)
+5. **Development Loop** — Calls `/feature:develop` for coding + review iterations
+6. **Acceptance Gate** — Mandatory compile + test pass; HTTP endpoints require three artifacts (route registration + route test + smoke test)
+7. **Documentation Update** — Updates architecture docs / version docs
+8. **Commit & Push** — Calls `/git:commit` + `/git:push`
 
-**收敛标准：** Critical = 0，High ≤ 2，或达到最大迭代轮次后自动升级复杂度档次。
+**Convergence Criteria:** Critical = 0, High ≤ 2, or auto-escalate complexity level after max iterations.
 
-**Triple-Check 收敛法：**
-- Claude（执行者）编码 → Codex（审查者）找盲区 → Claude 修复 → 循环直到收敛
+**Triple-Check Convergence:**
+- Claude (executor) codes → Codex (reviewer) finds blind spots → Claude fixes → loop until convergence
 
-#### 核心优势
+#### Core Advantages
 
-**1. 零上下文污染**
+**1. Zero Context Pollution**
 
-每个阶段在独立进程（`claude -p` 子进程或 Agent）中运行，阶段间通过持久化文件交接（`feature.md → plan.md → task-N.md`），而非共享内存状态。这消除了长对话中上下文累积导致的幻觉漂移和注意力衰减问题——每个子任务都以全新、精准的上下文启动。
+Each stage runs in an isolated process (`claude -p` subprocess or Agent), with inter-stage handoffs via persisted files (`feature.md → plan.md → task-N.md`) rather than shared memory. This eliminates hallucination drift and attention decay caused by context accumulation in long conversations — every subtask starts with a fresh, precise context.
 
-**2. 跨模型对抗审查（Triple-Check）**
+**2. Cross-Model Adversarial Review (Triple-Check)**
 
-执行者（Claude）和审查者（Codex）是不同模型，天然存在认知差异。Claude 的实现盲区往往正是 Codex 擅长发现的：
+The executor (Claude) and reviewer (Codex) are different models with inherent cognitive differences. Claude's implementation blind spots are precisely what Codex excels at finding:
 
-- 并发竞态、goroutine 泄漏、锁粒度错误
-- 资源未释放、连接池耗尽
-- 边界条件、错误路径遗漏
-- 宪法合规性（测试覆盖、日志分级、错误分层）
+- Concurrency races, goroutine leaks, lock granularity errors
+- Unreleased resources, connection pool exhaustion
+- Boundary conditions, missing error paths
+- Constitution compliance (test coverage, log levels, error layering)
 
-单模型自审会因相同的偏见而遗漏同类问题；双模型对抗则将这类系统性盲区暴露出来。
+Single-model self-review misses systematic issues due to shared biases; dual-model adversarial review exposes them.
 
-**3. 机械门禁，不依赖主观判断**
+**3. Mechanical Gates, Not Subjective Judgment**
 
-代码进入 Review 前必须通过硬性门禁：
+Code must pass hard gates before entering Review:
 
 ```
-编译通过 → 单元测试 → 集成测试（接口变更时）→ smoke 测试
+Compile → Unit Tests → Integration Tests (on interface changes) → Smoke Tests
 ```
 
-这些是机器验证，不是 AI 自评。门禁失败立即终止，不允许带着编译错误进入审查循环，杜绝了"先提交再修"的技术债务积累。
+These are machine verifications, not AI self-assessments. Gate failures halt immediately — no entering the review loop with compile errors, eliminating "commit now, fix later" technical debt.
 
-**4. 原子粒度提交，变更可追溯**
+**4. Atomic Commits, Traceable Changes**
 
-任务拆解强制每个提交对应单一职责（≤3 文件 / ≤100 行）。好处：
+Task decomposition enforces single-responsibility commits (≤3 files / ≤100 lines). Benefits:
 
-- 每个提交都能独立通过 CI
-- 出问题时可精确 `git bisect` 定位
-- Review 粒度细，审查者不会被大 PR 淹没
-- 避免"巨型提交"把好代码和问题代码混在一起
+- Each commit passes CI independently
+- Precise `git bisect` for root cause isolation
+- Fine-grained review scope — reviewers won't be overwhelmed by large PRs
+- Prevents "mega commits" mixing good code with problematic code
 
-**5. 上下文自修复机制**
+**5. Context Self-Repair Mechanism**
 
-当 Review 发现某类问题在多轮迭代中反复出现时，auto-work 不只修代码——它同时触发上下文修复：将项目级约束写入 `.ai/`（共享事实源），将 Claude 专用规则写入 `.claude/`。这意味着**同类错误在未来的工作流中不会再出现**，工作流随使用持续变强。
+When a Review identifies recurring issues across multiple iterations, auto-work doesn't just fix the code — it triggers context repair: writing project-level constraints into `.ai/` (shared source of truth) and Claude-specific rules into `.claude/`. This means **the same class of errors won't recur in future workflows** — the workflow continuously improves with use.
 
-**6. 复杂度自适应**
+**6. Adaptive Complexity**
 
-S / M / L 分级不是静态标签。L 级任务会被自动拆分为多个 M 级串行执行；M 级如果在迭代中发现范围超出预期，可自动升级并重新规划。这让单次 `/auto-work` 调用能稳健处理从单函数修改到跨模块重构的任何规模需求。
+S / M / L classification is not a static label. L-level tasks are automatically split into multiple M-level tasks executed serially; M-level tasks can auto-escalate and re-plan if scope exceeds expectations mid-iteration. This allows a single `/auto-work` call to handle anything from a single-function change to a cross-module refactor.
 
-**7. 经验资产积累**
+**7. Accumulated Experience Assets**
 
-每次工作流执行后，上下文修复、Review 发现、架构决策都沉淀到 `.ai/` 和 `.claude/`。仓库本身成为不断增长的工程经验库，后续工作流自动继承这些经验，而不是每次从零开始。
-
----
-
-### `/manual-work` — 人工检查点工作流
-
-与 auto-work 产出相同，但在关键节点暂停等待用户确认。
-
-**检查点：**
-
-| 阶段 | 检查内容 |
-|------|----------|
-| Stage 0 | 需求分级确认 |
-| Stage 0-B | 调研结果确认（如有） |
-| Stage 1 | feature.md 需求文档确认 |
-| **Stage 2** | **Plan / 架构方案确认（最重要）** |
-| Stage 4-C | 验收结果确认 |
-| Stage 6 | 推送确认 |
-
-用户可在任意检查点输入 `AUTOPILOT=true` 跳过后续所有确认，切换为全自动模式。
+After each workflow execution, context repairs, Review findings, and architectural decisions are persisted to `.ai/` and `.claude/`. The repository itself becomes a continuously growing engineering knowledge base — subsequent workflows automatically inherit this experience rather than starting from scratch.
 
 ---
 
-### `/feature:plan` — 方案创建工作流
+### `/manual-work` — Manual Checkpoint Workflow
 
-迭代生成 `plan.md` 直到质量收敛。
+Produces the same output as auto-work, but pauses at key milestones for user confirmation.
 
-**流程：** 奇数轮生成/修复方案 → 偶数轮 Codex 审查 → 循环（最多 20 轮）
+**Checkpoints:**
 
-**产出 `plan.md` 包含：**
-- 数据模型设计
-- API 接口规格
-- 实现流程
-- 测试策略
-- 风险评估
+| Stage | Review Content |
+|-------|----------------|
+| Stage 0 | Requirement classification confirmation |
+| Stage 0-B | Research results confirmation (if applicable) |
+| Stage 1 | feature.md requirements document confirmation |
+| **Stage 2** | **Plan / architecture confirmation (most important)** |
+| Stage 4-C | Acceptance results confirmation |
+| Stage 6 | Push confirmation |
 
-**收敛条件：** Critical = 0 且 Important ≤ 2
-
----
-
-### `/feature:develop` — 功能开发工作流
-
-按任务列表逐个实现，每个任务独立编码 + 审查循环。
-
-**每个任务的循环：**
-1. 编码实现
-2. 编译验证（快速失败门禁）
-3. Codex 审查（最多 2 轮）
-4. 自动修复编译 / 测试失败（最多 2 轮）
-5. 强制门禁：单元测试 + 集成测试（接口变更时）+ smoke 测试
-6. 上下文修复（如发现系统性缺口，更新 `.ai/`）
-7. Git 提交（每个任务一个原子提交）
+Users can enter `AUTOPILOT=true` at any checkpoint to skip all subsequent confirmations and switch to fully automated mode.
 
 ---
 
-### `/research:do` — 技术调研工作流
+### `/feature:plan` — Plan Creation Workflow
 
-为设计决策提供技术选型依据。
+Iteratively generates `plan.md` until quality converges.
 
-**流程：**
-1. 明确调研范围
-2. **并行 Web 搜索**（3 个 Agent 分片）：主流方案 / 实践经验 / 对比文章
-3. **项目上下文搜索**：扫描仓库现有实现
-4. 生成结构化 `research-result.md`
-5. 与用户确认结论
+**Flow:** Odd rounds generate/fix plan → Even rounds Codex reviews → Loop (max 20 rounds)
 
-**报告结构：** 问题定义 → 业界方案概览 → 对比表格 → 实战经验 → 项目适配分析 → 推荐结论
+**`plan.md` Output Includes:**
+- Data model design
+- API interface specifications
+- Implementation flow
+- Test strategy
+- Risk assessment
 
----
-
-### `/bug:fix` — Bug 修复工作流
-
-根因分析 → 最小化修复 → Codex 审查 → 经验沉淀。
-
-**阶段：**
-1. 定位问题（日志、调用链、假设验证）
-2. 最小化修复 + 编译验证 + 测试
-3. Codex 强制审查（`codex exec --full-auto`）
-4. Git 提交 + 如发现系统性问题则更新 `.ai/`
+**Convergence Condition:** Critical = 0 and Important ≤ 2
 
 ---
 
-### `/git:commit` — 规范提交工作流
+### `/feature:develop` — Feature Development Workflow
 
-- Claude 决定暂存范围（自动跳过敏感文件）
-- 生成规范格式的提交消息：`<type>(<scope>): <description>`
-- Codex 执行 `git add` + `git commit`
-- Hook 失败时创建新提交，不使用 `--amend`
+Implements tasks one by one from the task list, with independent coding + review loops per task.
 
----
-
-### `/git:push` — 安全推送工作流
-
-- 验证无未提交变更、禁止强推 main 分支
-- 安全检查（无密钥泄漏）
-- Codex 执行 `git push`，无 tracking 时自动添加 `-u origin <branch>`
+**Per-Task Loop:**
+1. Code implementation
+2. Compile verification (fast-fail gate)
+3. Codex review (max 2 rounds)
+4. Auto-fix compile / test failures (max 2 rounds)
+5. Mandatory gate: unit tests + integration tests (on interface changes) + smoke tests
+6. Context repair (if systematic gaps found, update `.ai/`)
+7. Git commit (one atomic commit per task)
 
 ---
 
-## 双模型协作架构
+### `/research:do` — Technical Research Workflow
+
+Provides technology selection rationale for design decisions.
+
+**Flow:**
+1. Define research scope
+2. **Parallel web search** (3 Agent shards): mainstream solutions / practical experience / comparison articles
+3. **Project context search**: scan existing repository implementations
+4. Generate structured `research-result.md`
+5. Confirm conclusions with user
+
+**Report Structure:** Problem definition → Industry solution overview → Comparison table → Practical experience → Project fit analysis → Recommendation
+
+---
+
+### `/bug:fix` — Bug Fix Workflow
+
+Root cause analysis → minimal fix → Codex review → experience consolidation.
+
+**Stages:**
+1. Locate the issue (logs, call chain, hypothesis verification)
+2. Minimal fix + compile verification + testing
+3. Mandatory Codex review (`codex exec --full-auto`)
+4. Git commit + update `.ai/` if systematic issue found
+
+---
+
+### `/git:commit` — Standardized Commit Workflow
+
+- Claude determines staging scope (automatically skips sensitive files)
+- Generates standardized commit message: `<type>(<scope>): <description>`
+- Codex executes `git add` + `git commit`
+- Creates new commit on hook failure — no `--amend`
+
+---
+
+### `/git:push` — Safe Push Workflow
+
+- Verifies no uncommitted changes; blocks force-push to main branch
+- Security check (no secret leaks)
+- Codex executes `git push`; automatically adds `-u origin <branch>` when no tracking branch exists
+
+---
+
+## Dual-Model Collaboration Architecture
 
 ```
-用户需求
-   │
-   ▼
-Claude（执行者）
-  ├── 编码实现
-  ├── 修复问题
-  └── 生成测试
+User Requirement
+      │
+      ▼
+Claude (Executor)
+  ├── Code implementation
+  ├── Fix issues
+  └── Generate tests
         │
         ▼
-   Codex（审查者）
-  ├── 对抗审查
-  ├── 找盲区（并发安全、资源泄漏、边界情况）
-  └── 验证修复
+  Codex (Reviewer)
+  ├── Adversarial review
+  ├── Find blind spots (concurrency safety, resource leaks, edge cases)
+  └── Verify fixes
         │
         ▼
-   收敛（Critical=0, High≤2）
+  Converged (Critical=0, High≤2)
         │
         ▼
-   Git 提交
+  Git Commit
 ```
 
 ---
 
-## 工作流目录结构
+## Workflow Directory Structure
 
-| 目录 | 职责 |
-|------|------|
-| `.ai/` | 跨 Agent 共享知识层（项目事实源） |
-| `.claude/` | Claude Code 专用运行时层 |
-| `.codex/` | Codex 运行时层 |
+| Directory | Responsibility |
+|-----------|----------------|
+| `.ai/` | Cross-Agent shared knowledge layer (source of truth) |
+| `.claude/` | Claude Code dedicated runtime layer |
+| `.codex/` | Codex runtime layer |
 
-### `.ai/`（跨 Agent 共享层）
+### `.ai/` (Cross-Agent Shared Layer)
 
-| 文件 | 内容 |
-|------|------|
-| `constitution.md` | 核心工程原则（简单优先、可观测性、低耦合、测试先行等） |
-| `constitution/` | 按模块拆分的详细规则（并发、测试验收、跨模块通信等） |
-| `context/project.md` | 项目技术栈、目录语义、关键约束 |
-| `context/reviewer-brief.md` | Review 执行标准、问题分级、状态定义、出池条件 |
+| File | Content |
+|------|---------|
+| `constitution.md` | Core engineering principles (simplicity first, observability, low coupling, test-first, etc.) |
+| `constitution/` | Module-specific detailed rules (concurrency, test acceptance, cross-module communication, etc.) |
+| `context/project.md` | Project tech stack, directory semantics, key constraints |
+| `context/reviewer-brief.md` | Review execution standards, issue classification, status definitions, resolution conditions |
 
-### `.claude/`（Claude Code 专用运行时层）
+### `.claude/` (Claude Code Dedicated Runtime Layer)
 
-| 目录 | 内容 |
-|------|------|
-| `commands/` | 工作流定义（auto-work、manual-work、feature 系列、research、bug fix、git） |
-| `constitution.md` | Claude 专用编码规范 |
-| `guides/` | 专题规则（上下文修复、取消语义、trace 调试等） |
-| `rules/` | 上下文修复、错误处理等规则文件 |
-| `skills/` | Claude 原生 skill 定义 |
+| Directory | Content |
+|-----------|---------|
+| `commands/` | Workflow definitions (auto-work, manual-work, feature series, research, bug fix, git) |
+| `constitution.md` | Claude-specific coding standards |
+| `guides/` | Topical rules (context repair, cancellation semantics, trace debugging, etc.) |
+| `rules/` | Context repair, error handling, and other rule files |
+| `skills/` | Claude native skill definitions |
 
 ---
 
-## 核心原则摘要
+## Core Principles Summary
 
-1. **简单优先** — 只实现需求明确要求的内容，不做预支设计
-2. **测试先行** — 新功能和缺陷修复从失败测试开始
-3. **原子提交** — 每个任务一个提交，≤3 文件 / ≤100 行
-4. **机械门禁** — 编译 + 测试在 Review 前强制通过（便宜检查优先）
-5. **文档驱动交接** — 阶段间只通过持久化文件交接（feature.md → plan.md → task-N.md）
-6. **上下文修复** — 系统性错误更新 `.ai/`，而不仅仅修复代码
+1. **Simplicity First** — Implement only what requirements explicitly ask; no speculative design
+2. **Test-Driven** — New features and bug fixes start from failing tests
+3. **Atomic Commits** — One commit per task, ≤3 files / ≤100 lines
+4. **Mechanical Gates** — Compile + tests must pass before Review (cheap checks first)
+5. **Document-Driven Handoff** — Stages communicate only via persisted files (feature.md → plan.md → task-N.md)
+6. **Context Repair** — Systematic errors update `.ai/`, not just the code
