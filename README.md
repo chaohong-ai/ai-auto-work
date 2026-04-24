@@ -31,6 +31,9 @@ AI Auto-Work is an **agentic coding workflow system** that orchestrates large la
 ## Quick Start
 
 ```bash
+# Fast path for small direct changes
+/fast-auto-work v0.2.0 fix-login-button align login button loading state
+
 # Fully automated: research → plan → code → review → commit
 /auto-work implement user avatar upload feature
 
@@ -91,6 +94,45 @@ No human intervention required. Handles the complete cycle from raw requirement 
 | 8 | Commit & Push | `/git:commit` + `/git:push` |
 
 **Convergence:** Critical = 0, High ≤ 2 — or auto-escalate complexity after max iterations.
+
+---
+
+### `/fast-auto-work` — Fast Path for Small Changes
+
+Optimized for direct small changes: bug fixes, narrow extensions, and low-risk edits on top of existing patterns.
+
+**Use it when:**
+
+- the change is expected to stay within `<= 3` implementation files
+- the module already has an established implementation pattern
+- you want code + build/test verification quickly, without full research / planning artifacts
+
+**It intentionally skips:**
+
+- research loop
+- `feature.md`, `plan.md`, `tasks/task-*.md`
+- formal acceptance report, module docs, and auto-push
+
+**Still preserved:**
+
+- compile gate
+- relevant test gate
+- automatic escalation when the diff exits fast-path scope
+
+**Typical output:**
+
+- `Docs/Version/{version_id}/{feature_name}/classification.txt`
+- `Docs/Version/{version_id}/{feature_name}/fast-auto-work-log.md`
+- `Docs/Version/{version_id}/{feature_name}/fast-auto-work-escalation.md` when the request exceeds the fast path
+- `Docs/Version/{version_id}/{feature_name}/fast-auto-work-artifacts/`
+
+**Example:**
+
+```bash
+/fast-auto-work v0.2.0 fix-auth-toast stabilize duplicate toast handling
+```
+
+Use `/auto-work` or `/manual-work` instead for cross-module work, contract changes, new system design, or anything that requires formal planning and acceptance.
 
 ---
 
@@ -228,6 +270,17 @@ A: No. ROUTE_MODE_B runs with Claude only (Agent tool), providing good review qu
 
 **Q: How does context repair work?**
 A: When Codex identifies a recurring class of issue (not a one-off mistake), the workflow writes the constraint into `.ai/` — the shared knowledge base loaded at the start of every future run. The same class of error won't recur.
+
+---
+
+## Usage Tips
+
+- Prefer `/fast-auto-work` for direct small edits, but switch to `/auto-work` as soon as the change touches routing, contracts, architecture files, or multiple top-level domains.
+- Keep the workspace clean before running `/fast-auto-work`. It aborts by default on a dirty worktree; `FAST_AUTO_WORK_ALLOW_DIRTY=1` is for debugging only and disables auto-commit.
+- Put stable requirement context in `Docs/Version/{version_id}/{feature_name}/idea.md`, then add only the delta in the command arguments. The fast path merges both inputs.
+- Let the fast path fail closed. If it detects out-of-scope changes, it writes an escalation file and points back to `/auto-work` or `/manual-work` instead of guessing.
+- Use `FAST_AUTO_WORK_COMMIT=1` only when you explicitly want a local commit after gates pass. Default behavior is verification without auto-commit.
+- Tune `CLAUDE_MODEL_CODE`, `FAST_AUTO_WORK_CLI_TIMEOUT`, and `FAST_AUTO_WORK_PREFLIGHT_TTL` when you need a different model, longer single-call timeout, or shorter preflight cache.
 
 ---
 
