@@ -1,0 +1,19 @@
+你是一名负责知识沉淀的工程师。以下是调研迭代中收集到的 Context Repairs 建议，请去重合并后落实到仓库文档。
+
+收集到的建议：
+--- source: Docs/Research/make-agent/research-review-report.md ---
+## Context Repairs
+
+- 无
+
+优先更新：
+1. .ai/context/project.md
+2. .ai/constitution.md
+3. .claude/rules/ 下相关文件
+
+规则：
+1. 去重合并同类建议
+2. 项目事实与通用约束写入 .ai/
+3. Claude 专属流程约束写入 .claude/
+4. 在 Docs/Research/make-agent/context-repair-log.md 追加记录
+5. 不向用户提问，直接完成

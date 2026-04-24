@@ -1,5 +1,5 @@
 ---
-description: 给一个需求，AI自动完成调研→方案→开发全流程
+description: 给一个需求，AI自动完成调研→方案→方案Review→开发→开发Review全流程
 argument-hint: <version_id> <feature_name> [需求描述]
 ---
 
@@ -59,6 +59,26 @@ auto-work 采用执行者 + 审查者分离架构，利用角色分工加速 Bug
 - `CLAUDE_MODEL`：全局兜底模型（不区分阶段，向后兼容）。如果设了 LIGHT/CODE 则此变量被覆盖
 - `CODEX_MODEL`：指定 Codex 审查模型（如 `o3`、`o4-mini`），默认使用 Codex CLI 默认模型
 - `REVIEW_SHARD_MODE`：review 分片模式（`single`/`parallel`），默认自动判断。设置后同时覆盖 develop/plan review 和 acceptance review。auto 逻辑：S/M 级强制 single；L 级在变更文件>15 或目录>4 或上轮 critical>0 时升级为 parallel；acceptance 阈值为文件>20 或目录>5。
+- `AUTO_WORK_RATE_LIMIT_MAX_RETRIES`：≥1 时启用次数上限；**默认 `0` = 无限重试**，直至成功或外部 Ctrl+C
+- `AUTO_WORK_RATE_LIMIT_MAX_WAIT`：≥1 时启用单次等待秒数上限（截断而非放弃）；**默认 `0` = 不截断**
+- `AUTO_WORK_RATE_LIMIT_BUFFER`：reset 时间额外缓冲秒数，默认 `60`，避免 reset 那一刻就重连被拒
+- `AUTO_WORK_RATE_LIMIT_FALLBACK_WAIT`：命中关键字但解析不到时间的兜底等待，默认 `600`
+- `AUTO_WORK_RATE_LIMIT_DISABLE`：置 `1` 完全关闭本机制，恢复旧"立即失败"行为（仅排障使用）
+
+**速率限制自动恢复（cli_call 内部机制，默认无限重试）：**
+
+`claude -p` 子进程在用量上限时输出形如 `You've hit your limit · resets 1am (Asia/Shanghai)` 并非零退出。`cli_call` 自动：
+1. 检测输出是否包含速率限制关键字（`hit your limit` / `usage limit reached` / `rate limit` / `quota`）
+2. 解析 `resets <time> (<TZ>)` 中的时间和时区
+3. 计算到 reset 时刻所需等待秒数 + `AUTO_WORK_RATE_LIMIT_BUFFER`
+4. sleep（每分钟打印心跳到 stderr），到点后重新发起同一 prompt
+5. **默认无限重试** —— 只要持续命中速率限制就持续等待+重试，直到调用成功或被 Ctrl+C / kill
+6. 若解析不到时间但命中关键字，按 `AUTO_WORK_RATE_LIMIT_FALLBACK_WAIT`（默认 600s）兜底等待
+7. 重试次数计入 `attempt` 但不消费 `CLI_CALL_COUNT`
+
+不命中关键字的失败（如 5xx、网络错误、auth 错误）保持原行为：直接返回非零给上游脚本，不会陷入死循环。
+
+如需限制重试次数（例如 CI 场景 6h 内必须收敛或失败），显式 export `AUTO_WORK_RATE_LIMIT_MAX_RETRIES=N`；如需限制单次等待时长（例如 reset 显示 12h 后但你只想等 1h），显式 export `AUTO_WORK_RATE_LIMIT_MAX_WAIT=3600`。
 
 **Agent 参数（模式B Agent 编排）：**
 - 轻量阶段 Agent：`model: "sonnet"`
@@ -365,5 +385,7 @@ bash .claude/scripts/auto-work-loop.sh "{VERSION_ID}" "{FEATURE_NAME}"
 - **模式B**：仅需 Agent tool 可用（Review 由独立 Agent 执行，质量略低于跨模型对抗但保持上下文隔离）
 - 全程无人工干预，所有决策自主完成
 - 总进度日志：`{FEATURE_DIR}/auto-work-log.md`
+  - 日志末尾包含 Token 消耗统计：按 trace 中 `prompt_bytes/stdout_bytes` 估算输入、输出、总 token，并按 stage/CLI 聚合。当前 CLI 未暴露真实 provider usage，因此统计列以 `Tokens~` 标记为近似值。
+  - 每轮完成后会把 `auto-work-log.md` 的节点耗时表同步追加到已存在的阶段产物文档中（`classification.txt`、`Docs/Research/{feature}/research-result.md`、`{FEATURE_DIR}` 根级 Markdown、`tasks/README.md`），使用 `AUTO_WORK_TIMING` 标记块去重替换。
 - 任务清单：`{FEATURE_DIR}/tasks/README.md`
 - 中断恢复：重新运行时会跳过已完成的阶段和任务（基于文件/状态检测，两种模式通用）

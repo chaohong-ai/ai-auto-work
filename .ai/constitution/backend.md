@@ -92,9 +92,79 @@ if err == repository.ErrUserNotFound {
 
 测试中同理，使用 `assert.ErrorIs(t, err, ErrXxx)` 而非 `assert.Equal(t, ErrXxx, err)`。根因：v0.0.3 account Task-04 review 反复标记此问题。
 
-## Error 类型判别必须使用 errors.As()（不可协商）
+## Error 类型判别与 interface{} 断言必须使用 comma-ok（不可协商）
 
-禁止裸类型断言 `err.(CustomType)`——当 err 为 nil 或非目标类型时会 panic，直接崩溃请求。必须使用 `errors.As(&target)` 或 comma-ok 模式 `v, ok := err.(CustomType)`。根因：v0.0.3 game-server 多次出现因裸类型断言导致的运行时 panic。
+<!-- Context Repair: v0.0.4 thin-client task-03 H2 — RefreshEventsToken c.Get("user_id").(string) 裸断言 panic；旧规则仅覆盖 err.(CustomType)，未泛化到非 error interface{} -->
+禁止对**任何** `interface{}` 值（包括但不限于 `err`、`c.Get(key)`、从 map/slice 取出的值）做裸类型断言——当值为 nil 或非目标类型时会 panic，直接崩溃请求。必须使用以下之一：
+
+1. **errors.As**（仅 error 类型）：`errors.As(err, &target)`
+2. **comma-ok 断言**：`v, ok := x.(T); if ok && v != "" { ... }`
+
+**典型违规场景（自动判 High）：**
+```go
+// ❌ err 裸断言 — panic if not CustomType
+customErr := err.(CustomError)
+
+// ❌ c.Get() 裸断言 — panic if user_id 未注入或 JWT 中间件未激活
+userID := c.Get("user_id").(string)
+
+// ❌ map value 裸断言
+val := someMap["key"].(string)
+```
+
+**正确模式：**
+```go
+// ✅ error 类型：errors.As
+var customErr *CustomError
+if errors.As(err, &customErr) { ... }
+
+// ✅ c.Get() / map value：comma-ok
+uid, ok := c.Get("user_id").(string)
+if !ok || uid == "" {
+    c.JSON(http.StatusUnauthorized, ...)
+    return
+}
+
+// ✅ map value：comma-ok
+val, ok := someMap["key"].(string)
+if !ok { ... }
+```
+
+**Ownership check 是最高频触发场景**：handler 中 `c.Get("user_id")` 用于权限校验时，JWT 中间件未激活或 key 不存在均会返回 `(nil, false)`，裸断言必 panic。
+
+根因：v0.0.3 game-server 多次裸断言 panic；v0.0.4 task-03 H2 在 ownership check 路径复现。
+
+## 错误分类先行禁令（不可协商）
+
+<!-- Context Repair: v0.0.4 thin-client task-01 round4 → task-02 → task-03 共 6+ 轮 RECURRING；task-02 CR-2 要求写入但未落地，task-03 升级为 Critical -->
+Go handler / service 中，对同一个 `err` 变量，**`logger.Error` 调用必须在所有 `errors.Is` / `errors.As` 语义分类之后**。若某 error 在下方被识别为预期业务条件（`ErrAlreadyExists`、`ErrNotFound`、`ErrUnauthorized` 等），则不得在分类之前调用 `logger.Error`，否则业务正常路径将被记录为系统故障级别日志，违反宪法 §9「业务正常路径记为 Error 视为违宪」。
+
+**禁止模式：**
+```go
+// ❌ 违宪：logger.Error 先于 errors.Is，幂等正常路径被记为系统故障
+if err != nil {
+    logger.Error("create session failed", zap.Error(err)) // ← 先于分类
+    if errors.Is(err, session.ErrAlreadyExists) {
+        return c.JSON(http.StatusOK, gin.H{"idempotent": true})
+    }
+    return c.JSON(http.StatusInternalServerError, ...)
+}
+```
+
+**正确模式：**
+```go
+// ✅ 先分类，再按语义选日志级别
+if err != nil {
+    if errors.Is(err, session.ErrAlreadyExists) {
+        logger.Info("create session: idempotent return", zap.String("user_id", req.UserID))
+        return c.JSON(http.StatusOK, gin.H{"idempotent": true})
+    }
+    logger.Error("create session failed", zap.Error(err)) // 非预期错误才用 Error
+    return c.JSON(http.StatusInternalServerError, ...)
+}
+```
+
+Reviewer 遇到违反此规则时自动升级为 **Critical**，无豁免。
 
 ## JSON Tag 完整性（omitempty 规则）
 

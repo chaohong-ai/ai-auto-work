@@ -33,6 +33,7 @@ Scope: 所有对本仓库执行 develop-review / plan-review 的 agent（Claude 
    - review-input 列举的主要改动文件与工作区真实改动文件严重不符
    - diff 内容属于上一任务的遗留（例如 scope 已更新为 task-N，但 `Changed Files` 内容仍为 task-(N-1) 的代码）
    - `## Changed Files` 内列出的文件与 `## Git Diff --stat` 显示的统计不一致
+   - task scope 声明的新增文件处于 **untracked** 状态（未执行 `git add`），导致其未出现在 `git diff --stat` 中——此情形属于 RECURRING stale-diff（task-01/task-02 已连续触发），reviewer 须同时追加 `[RECURRING]` 标记，并在 `## Context Repairs` 段注明：生成方须在 review-input 生成前执行 untracked 产物校验（参见 auto-work.md §阶段四"develop-review 输入产物 Untracked 校验"）
 
 5. **review-input diff 段落完整性（task-11 RECURRING 触发，阻断 review 流程）**：在执行第 4 条一致性校验前，先检查 `review-input-develop.md` 是否同时包含 `## Git Diff --stat` 和 `## Changed Files` 两个段落。若这两个段落**完全缺失**（而非内容过时），**必须立即阻断审查流程**：
    - 在报告开头标注 `⚠️ REVIEW_BLOCKED: INPUT_INCOMPLETE`，不得继续执行任何审查维度
@@ -47,6 +48,24 @@ Scope: 所有对本仓库执行 develop-review / plan-review 的 agent（Claude 
    - 整份验收报告结论直接判定为 `REMEDIATION_NEEDED`，禁止任何 REQ 继续推进为 `PASS`
    - 在报告末尾注明：需开发方修复输入摘要或实际提交代码后再重新提交验收
    - **根因**：历史实现文件已存在于工作区，不等于本次提交交付了这些文件；允许用历史状态代替本次 diff 会导致"永远验收通过"的假阳性，且下游部署/回滚无法以本次提交为基准
+
+7. **Phase 一致性（task-30 CR-2 触发，develop / acceptance 不得串扰）**：读完 `review-input-*.md` 与 `tasks/task-NN.md` 后，必须核对调用入口（prompt / review-input 文件名）声明的 review 阶段与 `tasks/task-NN.md` 的 `review_phase` 字段是否一致，命中下列任一情形直接判 Critical，**不得**降级为 High 或以"报告开头标注"为由继续走审查：
+   - 调用方以 `develop-review` 身份进入，但 `tasks/task-NN.md` 已声明 `review_phase: acceptance` —— 在报告总览区顶部标注 `⚠️ PHASE_MISMATCH` 并拒绝继续执行 develop-review 维度；
+   - 同一 feature 目录下 `review-input-develop.md` 与 `review-input-acceptance*.md` 同时存在并指向同一 task —— 视为生成侧 phase-switch 未完成（对应 `.ai/context/auto-work-gates.md` G5 失败），同样标 `⚠️ PHASE_MISMATCH` Critical；
+   - 提示词让 reviewer 把 acceptance 的 `base..HEAD` 证据搬进 develop-review 报告 —— 严禁借用，develop-review 的证据域只能是当前 worktree 的 `git diff --name-only ∪ git status --short --untracked-files=all`（与 §零-B 第 4 条一致，并补充 acceptance 反向流向禁令）；
+   - **正确处置**：向调用方返回 `PHASE_MISMATCH` 信号，要求生成侧执行 G5 清理 stale develop-input 后仅保留 acceptance review-input，再由 reviewer 以 acceptance 身份重新启动审查；不得在同一轮报告里同时出 develop-review 与 acceptance review 两套结论；
+   - **根因**：develop-review 与 acceptance-review 的证据域互斥（当前 worktree vs `base..HEAD`）、门禁语义不同（scope 交集 vs REQ 交付验证）；两者同轮并存会使 reviewer 以 acceptance 证据掩盖 develop-review 的 scope 失败，导致 task-30 C1-C4 型 RECURRING 问题永不收敛。
+
+8. **顶层 `## Gate Results` 段强制（v0.0.1 animator task-03 round 4 CR-3 触发）**：在执行第 5 条（`## Git Diff --stat` / `## Changed Files` 完整性）之前，必须先确认 `review-input-develop.md` 包含**顶层独立** `## Gate Results` section，字段至少含 `tracked / untracked / listed / missing / scope_intersection / status`，且位于 `## Changed Files` / `## Git Diff --stat` 之前。命中以下任一情形一律判 `REVIEW_BLOCKED: INPUT_INCOMPLETE` / Critical，**不得**降级为"报告开头标注后继续审查"：
+   - 顶层无 `## Gate Results` section；
+   - `Gate Results` 字样仅出现在 ```` ``` ```` 代码围栏内部、`diff --git` hunk 内、某个改动文件的 diff body 中、列表缩进（`  ## Gate Results`）或引用块（`> ## Gate Results`）下；
+   - `Gate Results` 紧跟的不是 `tracked:` / `untracked:` 等键值行，而是另一个 diff hunk / 表格 / 段落叙述；
+   - `## Gate Results` 位于 `## Changed Files` 之后；
+   - 存在但 `missing` 字段非 0 或 `scope_intersection` 为 0 —— 生成侧 G2 / G6 未正确收敛，reviewer 不得代替放行；
+   - **根因**：允许 reviewer 用 `## Git Diff --stat` / `## Changed Files` 存在就推进审查，等于把 `Gate Results` 权威语义降级为"软约束"；v0.0.1 animator task-03 round 4 连续多轮把 `Gate Results` 字样埋进 diff body 绕开旧版规则，本条显式把"顶层段存在"作为 Critical 级入口门禁；
+   - **正确处置**：向调用方返回 `REVIEW_BLOCKED: INPUT_INCOMPLETE: GATE_RESULTS_MISSING` 信号，要求生成侧重新执行 `.ai/context/auto-work-gates.md §G2 第 5 项 + §G6 post-write validator` 后再启动 reviewer，不得在本轮报告继续执行任何审查维度。
+
+9. **迭代日志 FIXED 声称核对（v0.0.1 animator task-03 round 4 CR-1/CR-2 触发）**：如 `develop-iteration-log-task-NN.md` 声明"上轮 CR 已 FIXED / Gate Results 已加入 / 三源已重采 / 未跟踪产物已列入 Changed Files / `-race` 已跑"，reviewer 必须逐条与落盘 `review-input-*.md` 对照，不得因"log 已标注 FIXED"而放行；任一声称与磁盘实际不一致即判 `FIXED_CLAIM_MISMATCH` Critical [RECURRING]，计入宪法 §8 门禁。配套生成侧规则见 `.ai/context/auto-work-gates.md §G6 第 5 项`。
 
 ---
 
@@ -220,12 +239,13 @@ Context Repairs 每条必须包含：
 2. `Backend/tests/smoke/*.hurl` 冒烟测试
 
 ### 高频审查盲区
-1. **并发竞态**: goroutine 共享状态是否有锁保护？channel 是否可能阻塞？
+1. **并发竞态**: goroutine 共享状态是否有锁保护？channel 是否可能阻塞？是否存在裸 goroutine 冒充 Actor/Map.Post 串行化（搜 `go func` / `go s\.` 是否落入 Entity 读写路径）？
 2. **资源泄漏**: 文件句柄/DB连接/HTTP Body 是否正确关闭？defer 位置正确？
-3. **异常路径盲区**: 错误分支是否真正处理？是否 happy-path-only？
+3. **异常路径盲区**: 错误分支是否真正处理？是否 happy-path-only？Marshal/Serialize 失败路径是否向等待方写入兜底信号，避免主 goroutine 在 `select` 上永久阻塞？
 4. **边界输入**: 空切片/nil map/零值 struct/超长字符串/并发写 map
 5. **安全漏洞**: 注入风险/硬编码凭证/未校验外部输入/租户隔离缺失
 6. **测试质量**: 只覆盖 happy path？缺少表格驱动测试？崩溃窗口测试是否用真实进程终止？
+7. **协议字段类型 vs 语义对齐（task-11 H2 RECURRING 触发）**: proto/schema 中声明为字符串的业务字段（`entity_type`、`role`、`state_tag`、`asset_kind` 等）禁止用 `strconv.Itoa(int(enum))` / `fmt.Sprintf("%d", ...)` 生成——这会输出 `"0"/"1"/"2"`，客户端的字符串分支（如 `entity_type == "player"`）全部 miss 且不会在编译期暴露。必须走显式 `map[EnumType]string` 或读取业务侧注册的 tag。Review 时对所有 `strconv.Itoa(int(` / `fmt.Sprintf("%d"` 的赋值回溯对应 proto 字段类型，类型是字符串即判 High。
 
 ### 元数据尾行（必须追加）
 - **Develop review:** `<!-- counts: critical=X high=Y medium=Z -->`

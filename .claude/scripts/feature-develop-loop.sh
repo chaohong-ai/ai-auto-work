@@ -335,28 +335,37 @@ cleanup_checkpoints() {
 # 输出空格分隔的模块列表：Backend MCP Frontend Tools
 _detect_affected_modules() {
     local modules=""
+    local task_files=""
     # 从 task 文件的 files: 字段提取
     if [ -n "$TASK_FILE" ] && [ -f "$TASK_FILE" ]; then
-        local task_files
         task_files=$(sed -n '/^files:/,/^[^[:space:]-]/p' "$TASK_FILE" | grep '^\s*-' | sed 's/^\s*-\s*//' | tr -d '"' || true)
-        if echo "$task_files" | grep -q "^Backend/"; then modules="$modules Backend"; fi
-        if echo "$task_files" | grep -q "^MCP/"; then modules="$modules MCP"; fi
-        if echo "$task_files" | grep -q "^Frontend/"; then modules="$modules Frontend"; fi
-        if echo "$task_files" | grep -q "^Tools/"; then modules="$modules Tools"; fi
+    fi
+    # 补充：task 范围段落中声明的路径（"范围"/"修改"/"新增" 行常带路径）
+    if [ -n "$TASK_FILE" ] && [ -f "$TASK_FILE" ]; then
+        local scope_paths
+        scope_paths=$(grep -oE '(GameServer|Engine|Backend|MCP|Frontend|Tools)/[A-Za-z0-9_./-]+' "$TASK_FILE" 2>/dev/null | sort -u || true)
+        task_files=$(printf '%s\n%s\n' "$task_files" "$scope_paths")
+    fi
+    if [ -n "$task_files" ]; then
+        echo "$task_files" | grep -q "^GameServer/" && modules="$modules GameServer"
+        echo "$task_files" | grep -q "^Engine/" && modules="$modules Engine"
+        echo "$task_files" | grep -q "^Backend/" && modules="$modules Backend"
+        echo "$task_files" | grep -q "^MCP/" && modules="$modules MCP"
+        echo "$task_files" | grep -q "^Frontend/" && modules="$modules Frontend"
+        echo "$task_files" | grep -q "^Tools/" && modules="$modules Tools"
     fi
     # 补充：git diff 实际变更（可能超出 task 声明）
     local diff_files
     diff_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only 2>/dev/null || true)
     if [ -n "$diff_files" ]; then
+        if echo "$diff_files" | grep -q "^GameServer/" && [[ ! "$modules" == *GameServer* ]]; then modules="$modules GameServer"; fi
+        if echo "$diff_files" | grep -q "^Engine/" && [[ ! "$modules" == *Engine* ]]; then modules="$modules Engine"; fi
         if echo "$diff_files" | grep -q "^Backend/" && [[ ! "$modules" == *Backend* ]]; then modules="$modules Backend"; fi
         if echo "$diff_files" | grep -q "^MCP/" && [[ ! "$modules" == *MCP* ]]; then modules="$modules MCP"; fi
         if echo "$diff_files" | grep -q "^Frontend/" && [[ ! "$modules" == *Frontend* ]]; then modules="$modules Frontend"; fi
         if echo "$diff_files" | grep -q "^Tools/" && [[ ! "$modules" == *Tools* ]]; then modules="$modules Tools"; fi
     fi
-    # 兜底：什么都没检测到时跑全量
-    if [ -z "$modules" ]; then
-        modules="Backend MCP Frontend Tools"
-    fi
+    # 兜底：检测不到任何模块 → 返回空（不做编译门禁，避免触碰无关模块的历史问题）
     echo "$modules" | xargs  # 去掉前后空格
 }
 
@@ -397,17 +406,17 @@ run_compile_test() {
     affected=$(_detect_affected_modules)
     echo "  [SCOPE] 受影响模块: ${affected}" >&2
 
-    # Go 服务端
+    # Go 服务端（创作平台 Backend，自有 go.mod）
     if [[ "$affected" == *Backend* ]] && [ -d "Backend" ]; then
         local go_pkgs
         go_pkgs=$(_detect_go_packages)
-        echo "  [SCOPE] Go 包: ${go_pkgs}" >&2
+        echo "  [SCOPE] Go 包(Backend): ${go_pkgs}" >&2
         # shellcheck disable=SC2086
         if ! (cd Backend && go build $go_pkgs 2>&1) >/dev/null 2>&1; then
             compile_ok=0
-            echo "  [COMPILE] Go Server: FAIL" >&2
+            echo "  [COMPILE] Go Backend: FAIL" >&2
         else
-            echo "  [COMPILE] Go Server: OK" >&2
+            echo "  [COMPILE] Go Backend: OK" >&2
             local test_output
             # shellcheck disable=SC2086
             test_output=$(cd Backend && go test -short -count=1 $go_pkgs 2>&1) || true
@@ -419,8 +428,35 @@ run_compile_test() {
             [ -z "$failed" ] && failed=0
             test_pass=$((test_pass + passed))
             test_total=$((test_total + passed + failed))
-            echo "  [TEST] Go Server: ${passed} pass / ${failed} fail" >&2
+            echo "  [TEST] Go Backend: ${passed} pass / ${failed} fail" >&2
         fi
+    fi
+
+    # Go 游戏服务器（GameServer，独立 go.mod，领域隔离）
+    if [[ "$affected" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ]; then
+        echo "  [SCOPE] Go 包(GameServer): ./..." >&2
+        if ! (cd GameServer && go build ./... 2>&1) >/dev/null 2>&1; then
+            compile_ok=0
+            echo "  [COMPILE] Go GameServer: FAIL" >&2
+        else
+            echo "  [COMPILE] Go GameServer: OK" >&2
+            local gs_test_output
+            gs_test_output=$(cd GameServer && go test -short -count=1 ./... 2>&1) || true
+            local gs_passed
+            gs_passed=$(echo "$gs_test_output" | grep -c "^ok" 2>/dev/null || true)
+            local gs_failed
+            gs_failed=$(echo "$gs_test_output" | grep -c "^FAIL" 2>/dev/null || true)
+            [ -z "$gs_passed" ] && gs_passed=0
+            [ -z "$gs_failed" ] && gs_failed=0
+            test_pass=$((test_pass + gs_passed))
+            test_total=$((test_total + gs_passed + gs_failed))
+            echo "  [TEST] Go GameServer: ${gs_passed} pass / ${gs_failed} fail" >&2
+        fi
+    fi
+
+    # Engine (GDScript)：无编译器，仅检查文件存在性；深度检查交由 AI review + acceptance gate
+    if [[ "$affected" == *Engine* ]] && [ -d "Engine" ]; then
+        echo "  [COMPILE] Engine (GDScript): SKIP (no static compiler)" >&2
     fi
 
     # TypeScript MCP
@@ -633,7 +669,7 @@ ${TASK_SCOPE_PROMPT}}
         fi
 
         mark_stage "develop-iteration" "${TASK_FILE:+$(basename "${TASK_FILE}" .md)}" "$ROUND"
-        cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
+        cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || true
 
         # ══ 机械判定：编译 + 测试 ══
         echo ""
@@ -663,6 +699,9 @@ ${TASK_SCOPE_PROMPT}}
                     # shellcheck disable=SC2086
                     COMPILE_ERRORS+=$(cd Backend && go build $_go_pkgs 2>&1 | head -30 || true)$'\n'
                 fi
+                if [[ "$_affected" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ]; then
+                    COMPILE_ERRORS+=$(cd GameServer && go build ./... 2>&1 | head -30 || true)$'\n'
+                fi
                 if [[ "$_affected" == *MCP* ]] && [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
                     COMPILE_ERRORS+=$(cd MCP && npx tsc --noEmit 2>&1 | head -30 || true)$'\n'
                 fi
@@ -677,7 +716,7 @@ ${COMPILE_ERRORS}
 \`\`\`
 
 修复后重新运行编译命令验证。"
-                cli_call "$FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
+                cli_call "$FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
 
                 # 重新测量基线
                 METRICS=$(run_compile_test)
@@ -691,18 +730,27 @@ ${COMPILE_ERRORS}
             # 首轮测试失败 → 自动修复测试（scope 到受影响包）
             if [ "$BASELINE_COMPILE" -eq 1 ] && [ "$BASELINE_TEST_PASS" -lt "$BASELINE_TEST_TOTAL" ] && [ "$BASELINE_TEST_TOTAL" -gt 0 ]; then
                 echo "  部分测试失败，启动自动修复..."
-                local _go_test_pkgs
-                _go_test_pkgs=$(_detect_go_packages)
-                # shellcheck disable=SC2086
-                TEST_ERRORS=$(cd Backend && go test -short -count=1 $_go_test_pkgs 2>&1 | grep -E 'FAIL|Error|panic' | head -20 || echo "")
+                _affected=$(_detect_affected_modules)
+                TEST_ERRORS=""
+                _verify_cmd=""
+                if [[ "$_affected" == *Backend* ]] && [ -d "Backend" ]; then
+                    _go_test_pkgs=$(_detect_go_packages)
+                    # shellcheck disable=SC2086
+                    TEST_ERRORS+=$(cd Backend && go test -short -count=1 $_go_test_pkgs 2>&1 | grep -E 'FAIL|Error|panic' | head -20 || echo "")$'\n'
+                    _verify_cmd="cd Backend && go test -short -count=1 ${_go_test_pkgs}"
+                fi
+                if [[ "$_affected" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ]; then
+                    TEST_ERRORS+=$(cd GameServer && go test -short -count=1 ./... 2>&1 | grep -E 'FAIL|Error|panic' | head -20 || echo "")$'\n'
+                    _verify_cmd="${_verify_cmd:+${_verify_cmd} && }cd GameServer && go test -short -count=1 ./..."
+                fi
                 FIX_PROMPT="单元测试部分失败，请修复：
 
 \`\`\`
 ${TEST_ERRORS}
 \`\`\`
 
-分析失败的测试用例，判断是代码 bug 还是测试需要更新。修复后重新运行 cd Backend && go test -short -count=1 ${_go_test_pkgs} 验证。"
-                cli_call "$FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
+分析失败的测试用例，判断是代码 bug 还是测试需要更新。修复后重新运行 ${_verify_cmd} 验证。"
+                cli_call "$FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
 
                 METRICS=$(run_compile_test)
                 BASELINE_COMPILE=$(echo "$METRICS" | cut -d: -f1)

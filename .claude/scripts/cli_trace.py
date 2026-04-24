@@ -252,6 +252,11 @@ def _write_trace(root: Path, record: dict) -> None:
         _debug(f"trace write failed (swallowed): {e!r}")
 
 
+def _estimate_tokens(byte_count: int) -> int:
+    """Best-effort estimate; provider token usage is not exposed by the CLI."""
+    return (max(byte_count, 0) + 3) // 4
+
+
 def main(argv: list[str]) -> int:
     # Ensure stdout/stderr use UTF-8 on Windows (default may be GBK/cp936 which
     # cannot encode characters like ✓ U+2713 that Claude commonly outputs).
@@ -310,6 +315,10 @@ def main(argv: list[str]) -> int:
         exit_code, stdout_bytes, tail, pid = _stream_subprocess(argv_real, stdin_text)
     duration_ms = int((time.monotonic() - t0) * 1000)
 
+    prompt_bytes = len(prompt.encode("utf-8", errors="replace"))
+    estimated_input_tokens = _estimate_tokens(prompt_bytes)
+    estimated_output_tokens = _estimate_tokens(stdout_bytes)
+
     record = {
         "ts": ts_started,
         "stage": stage,
@@ -319,10 +328,14 @@ def main(argv: list[str]) -> int:
         "model": model,
         "prompt_file": prompt_rel,
         "prompt_sha256": sha,
-        "prompt_bytes": len(prompt.encode("utf-8", errors="replace")),
+        "prompt_bytes": prompt_bytes,
+        "estimated_input_tokens": estimated_input_tokens,
         "exit_code": exit_code,
         "duration_ms": duration_ms,
         "stdout_bytes": stdout_bytes,
+        "estimated_output_tokens": estimated_output_tokens,
+        "estimated_total_tokens": estimated_input_tokens + estimated_output_tokens,
+        "token_estimate_source": "bytes_div_4",
         "stdout_tail": tail,
         "feature_dir": feature_dir,
         "pid": pid,

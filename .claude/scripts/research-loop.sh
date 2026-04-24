@@ -175,7 +175,7 @@ $(load_contract .claude/contracts/research-do/gates.md)
 
 【重要：跨模型协作规则】
 Review 报告来自 Codex，它作为独立审查者检查了你的调研报告。
-- 认真对待每一条发现，不要因为"这是另一个 AI 说的"而轻视
+- 认真对待每一条发现，不要因为\"这是另一个 AI 说的\"而轻视
 - 如果某条发现标注了 [RECURRING]，说明你在上轮修复中没有真正补充到位，本轮必须换策略
 - 修复后确保报告整体逻辑自洽，新增内容与原内容不矛盾
 
@@ -225,7 +225,7 @@ $(load_contract .claude/contracts/research-review/gates.md)
 $(load_contract .claude/contracts/research-review/outputs.md)
 - 不要询问用户，直接结束"
 
-        codex_review_exec "$PROMPT" 2>&1 | tail -20
+        codex_review_exec "$PROMPT" 2>&1 | tail -20 || true
         defer_context_repairs "$REVIEW_FILE"
 
         # 分级落盘：Critical/Recurring 的上下文缺口立即修复，确保下轮修复可读到新规则

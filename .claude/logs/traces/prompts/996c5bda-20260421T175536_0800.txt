@@ -1,0 +1,28 @@
+你是一名资深技术架构师。对以下主题进行技术调研，输出调研报告。
+
+【必读】
+- Docs/Research/make-agent/idea.md — 调研需求（如存在）
+- 宪法已自动加载
+
+【调研主题】
+topic: make-agent
+
+【按需展开】
+- 搜索项目中与调研主题相关的已有实现
+- Docs/Engine/、Docs/Research/ — 仅已有相关文档时读取
+
+【输出】
+- Docs/Research/make-agent/research-result.md
+- 报告格式：问题定义 → 业界方案概览(>=3个) → 方案对比表 → 业界实战经验 → 项目适配分析 → 推荐 + 参考资料
+- 复杂调研额外输出 Docs/Research/make-agent/research-result/*.md
+
+【硬性 gate】
+- 至少覆盖 3 个业界方案
+- 方案对比表 + 项目适配性分析
+- 事实信息标注来源
+- 最终推荐有明确选择依据
+
+自动化模式规则：
+1. 如果 idea.md 存在则以其为需求，否则以 topic 为主题，调研深度'深入对比'
+2. 不向用户提问，不等待讨论
+3. 完成后直接结束

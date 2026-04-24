@@ -57,70 +57,6 @@ format_duration() {
     fi
 }
 
-extract_stage_timing_table() {
-    awk '
-        /^\| 阶段 \| 状态 \|/ { in_table=1; print; next }
-        in_table && /^\|------/ { print; next }
-        in_table && /^\|/ { print; next }
-        in_table { exit }
-    ' "$WORK_LOG"
-}
-
-append_timing_block() {
-    local target_file="$1"
-    local timing_file="$2"
-    local tmp_file
-
-    [ -f "$target_file" ] || return 0
-    [ -s "$timing_file" ] || return 0
-
-    tmp_file=$(mktemp 2>/dev/null || mktemp -t auto-work-timing)
-    awk '
-        /^<!-- AUTO_WORK_TIMING_START -->$/ { skip=1; next }
-        /^<!-- AUTO_WORK_TIMING_END -->$/ { skip=0; next }
-        skip != 1 { print }
-    ' "$target_file" > "$tmp_file" 2>/dev/null || {
-        rm -f "$tmp_file"
-        return 0
-    }
-    mv "$tmp_file" "$target_file"
-
-    {
-        echo ""
-        echo "<!-- AUTO_WORK_TIMING_START -->"
-        echo "## Auto-Work 节点耗时"
-        echo ""
-        echo "> 本节由 auto-work 自动写入，来源为本轮 \`auto-work-log.md\` 的阶段表。"
-        echo ""
-        cat "$timing_file"
-        echo "<!-- AUTO_WORK_TIMING_END -->"
-    } >> "$target_file"
-}
-
-append_timing_to_output_docs() {
-    local timing_file
-    local doc
-
-    timing_file=$(mktemp 2>/dev/null || mktemp -t auto-work-stage-timing)
-    extract_stage_timing_table > "$timing_file" 2>/dev/null || true
-    if [ ! -s "$timing_file" ]; then
-        rm -f "$timing_file"
-        return 0
-    fi
-
-    append_timing_block "$CLASSIFY_FILE" "$timing_file"
-    append_timing_block "${TASKS_DIR:-}/README.md" "$timing_file"
-    append_timing_block "Docs/Research/${FEATURE_NAME}/research-result.md" "$timing_file"
-
-    for doc in "$FEATURE_DIR"/*.md; do
-        [ -f "$doc" ] || continue
-        [ "$(basename "$doc")" = "auto-work-log.md" ] && continue
-        append_timing_block "$doc" "$timing_file"
-    done
-
-    rm -f "$timing_file"
-}
-
 # 记录复杂度升级事件到日志和 classification.txt
 record_upgrade() {
     local from="$1"
@@ -1096,7 +1032,7 @@ ${REQUIREMENT}
 - P0=核心必做, P1=重要, P2=可选
 - 直接写文件，不要向用户提问"
 
-    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
 
     if [ ! -f "${FEATURE_DIR}/feature.md" ]; then
         echo "ERROR: feature.md 生成失败"
@@ -1283,7 +1219,7 @@ depends_on: [\"task-01\"]
 - depends_on 必须显式列出，即使为空也要写 []
 - 每个任务的 name 应该能直接作为 commit message 的描述（如：\"定义 Game 数据模型\"、\"实现 GameRepository MongoDB 适配\"）"
 
-    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || true
+    cli_call "$PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
 
     TASK_COUNT=$(ls "$TASKS_DIR"/task-*.md 2>/dev/null | wc -l)
     if [ "$TASK_COUNT" -eq 0 ]; then
@@ -1327,7 +1263,7 @@ for TASK_FILE in $TASK_FILES; do
     TASK_NUM=$((COMPLETED_TASKS + FAILED_TASKS + 1))
 
     # 读取任务名称（跳过检查也需要）
-    TASK_NAME=$(grep "^name:" "$TASK_FILE" | sed 's/^name: *//; s/^"//; s/"$//' || echo "$TASK_BASENAME")
+    TASK_NAME=$(grep "^name:" "$TASK_FILE" | sed 's/^name: *//' || echo "$TASK_BASENAME")
 
     # 检查任务状态（跳过已完成的）— 带 git commit 验证
     if grep -qE "status: (completed|done)" "$TASK_FILE" 2>/dev/null; then
@@ -1384,41 +1320,20 @@ for TASK_FILE in $TASK_FILES; do
         continue
     fi
 
-    # ── 集成验证门禁（原子化：每个任务完成后必须通过任务作用域模块编译） ──
-    # 基于 task 范围 + git diff 检测受影响模块，仅对这些模块执行编译门禁。
-    # 不对 task 未触及的模块做编译门禁，避免被无关基线问题（如 Backend session_handler 旧 bug）阻断。
-    echo "[${TASK_BASENAME}] 集成验证门禁：作用域编译..."
+    # ── 集成验证门禁（原子化：每个任务完成后必须通过全项目编译） ──
+    echo "[${TASK_BASENAME}] 集成验证门禁：全项目编译..."
     INTEGRATION_OK=1
-    GATE_AFFECTED=""
-    _gate_task_paths=$(grep -oE '(GameServer|Engine|Backend|MCP|Frontend|Tools)/[A-Za-z0-9_./-]+' "$TASK_FILE" 2>/dev/null | sort -u || true)
-    _gate_diff_files=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-    for _p in GameServer Engine Backend MCP Frontend Tools; do
-        if echo "${_gate_task_paths}"$'\n'"${_gate_diff_files}" | grep -qE "^${_p}/"; then
-            GATE_AFFECTED="${GATE_AFFECTED} ${_p}"
-        fi
-    done
-    GATE_AFFECTED=$(echo "$GATE_AFFECTED" | xargs)
-    echo "  [GATE SCOPE] ${GATE_AFFECTED:-<none>}"
 
-    if [[ "$GATE_AFFECTED" == *Backend* ]] && [ -d "Backend" ]; then
+    if [ -d "Backend" ]; then
         if ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
-            echo "  [GATE] Go Backend 编译: FAIL"
+            echo "  [GATE] Go Server 编译: FAIL"
             INTEGRATION_OK=0
         else
-            echo "  [GATE] Go Backend 编译: OK"
+            echo "  [GATE] Go Server 编译: OK"
         fi
     fi
 
-    if [[ "$GATE_AFFECTED" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ]; then
-        if ! (cd GameServer && go build ./... 2>&1) >/dev/null 2>&1; then
-            echo "  [GATE] Go GameServer 编译: FAIL"
-            INTEGRATION_OK=0
-        else
-            echo "  [GATE] Go GameServer 编译: OK"
-        fi
-    fi
-
-    if [[ "$GATE_AFFECTED" == *MCP* ]] && [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
+    if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ]; then
         if ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
             echo "  [GATE] TS MCP 编译: FAIL"
             INTEGRATION_OK=0
@@ -1427,7 +1342,7 @@ for TASK_FILE in $TASK_FILES; do
         fi
     fi
 
-    if [[ "$GATE_AFFECTED" == *Frontend* ]] && [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ]; then
+    if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ]; then
         if ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
             echo "  [GATE] TS Client 编译: FAIL"
             INTEGRATION_OK=0
@@ -1439,30 +1354,26 @@ for TASK_FILE in $TASK_FILES; do
     if [ "$INTEGRATION_OK" -eq 0 ]; then
         echo "WARNING: ${TASK_BASENAME} 集成验证失败，尝试自动修复..."
         INTEGRATION_ERRORS=""
-        [[ "$GATE_AFFECTED" == *Backend* ]] && [ -d "Backend" ] && INTEGRATION_ERRORS+=$(cd Backend && go build ./... 2>&1 | head -20 || true)$'\n'
-        [[ "$GATE_AFFECTED" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ] && INTEGRATION_ERRORS+=$(cd GameServer && go build ./... 2>&1 | head -20 || true)$'\n'
-        [[ "$GATE_AFFECTED" == *MCP* ]] && [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd MCP && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
-        [[ "$GATE_AFFECTED" == *Frontend* ]] && [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd Frontend && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
+        [ -d "Backend" ] && INTEGRATION_ERRORS+=$(cd Backend && go build ./... 2>&1 | head -20 || true)$'\n'
+        [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd MCP && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
+        [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && INTEGRATION_ERRORS+=$(cd Frontend && npx tsc --noEmit 2>&1 | head -20 || true)$'\n'
 
         GATE_FIX_PROMPT="任务 ${TASK_BASENAME} 完成后集成编译失败。请修复以下编译错误，只修复编译问题，不做其他改动：
 
 \`\`\`
 ${INTEGRATION_ERRORS}
 \`\`\`"
-        cli_call "$GATE_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+        cli_call "$GATE_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
 
-        # 重新验证修复是否成功（仅作用域内模块）
+        # 重新验证修复是否成功
         INTEGRATION_OK=1
-        if [[ "$GATE_AFFECTED" == *Backend* ]] && [ -d "Backend" ] && ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
+        if [ -d "Backend" ] && ! (cd Backend && go build ./... 2>&1) >/dev/null 2>&1; then
             INTEGRATION_OK=0
         fi
-        if [[ "$GATE_AFFECTED" == *GameServer* ]] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ] && ! (cd GameServer && go build ./... 2>&1) >/dev/null 2>&1; then
+        if [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
             INTEGRATION_OK=0
         fi
-        if [[ "$GATE_AFFECTED" == *MCP* ]] && [ -d "MCP" ] && [ -f "MCP/tsconfig.json" ] && ! (cd MCP && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
-            INTEGRATION_OK=0
-        fi
-        if [[ "$GATE_AFFECTED" == *Frontend* ]] && [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
+        if [ -d "Frontend" ] && [ -f "Frontend/tsconfig.json" ] && ! (cd Frontend && npx tsc --noEmit 2>&1) >/dev/null 2>&1; then
             INTEGRATION_OK=0
         fi
 
@@ -1491,7 +1402,6 @@ ${INTEGRATION_ERRORS}
 
     # 检测变更模块类型
     HAS_GO_CHANGES=0
-    HAS_GS_CHANGES=0
     HAS_TS_CHANGES=0
     HAS_PY_CHANGES=0
     GO_AFFECTED_PACKAGES=""
@@ -1505,9 +1415,6 @@ ${INTEGRATION_ERRORS}
                 HAS_GO_CHANGES=1
                 pkg_dir=$(dirname "$file")
                 GO_AFFECTED_PACKAGES="${GO_AFFECTED_PACKAGES} ./${pkg_dir#Backend/}/..."
-                ;;
-            GameServer/*.go)
-                HAS_GS_CHANGES=1
                 ;;
             Engine/*.go)
                 HAS_GO_CHANGES=1
@@ -1540,9 +1447,9 @@ ${INTEGRATION_ERRORS}
         TEST_FAILURES=""
         TEST_GATE_OK=1
 
-        # Go 测试（Backend）
+        # Go 测试
         if [ "$HAS_GO_CHANGES" -eq 1 ] && [ -d "Backend" ]; then
-            echo "  [TEST] Go Backend: go test -short -count=1 ${GO_AFFECTED_PACKAGES}"
+            echo "  [TEST] Go: go test -short -count=1 ${GO_AFFECTED_PACKAGES}"
             GO_TEST_OUTPUT=$(cd Backend && go test -short -count=1 $GO_AFFECTED_PACKAGES 2>&1) || true
             GO_TEST_FAIL=$(echo "$GO_TEST_OUTPUT" | grep -c "^FAIL" 2>/dev/null || true)
             GO_TEST_FAIL=$(echo "$GO_TEST_FAIL" | tail -1 | tr -d '\r')
@@ -1550,29 +1457,11 @@ ${INTEGRATION_ERRORS}
             if [ "$GO_TEST_FAIL" -gt 0 ]; then
                 TEST_GATE_OK=0
                 TEST_FAILURES="${TEST_FAILURES}
-[Go Backend Test Failures]
+[Go Test Failures]
 $(echo "$GO_TEST_OUTPUT" | grep -E 'FAIL|Error|panic|---' | head -30)"
-                echo "  [TEST] Go Backend: FAIL (${GO_TEST_FAIL} packages)"
+                echo "  [TEST] Go: FAIL (${GO_TEST_FAIL} packages)"
             else
-                echo "  [TEST] Go Backend: PASS"
-            fi
-        fi
-
-        # Go 测试（GameServer，独立 go.mod）
-        if [ "$HAS_GS_CHANGES" -eq 1 ] && [ -d "GameServer" ] && [ -f "GameServer/go.mod" ]; then
-            echo "  [TEST] Go GameServer: go test -short -count=1 ./..."
-            GS_TEST_OUTPUT=$(cd GameServer && go test -short -count=1 ./... 2>&1) || true
-            GS_TEST_FAIL=$(echo "$GS_TEST_OUTPUT" | grep -c "^FAIL" 2>/dev/null || true)
-            GS_TEST_FAIL=$(echo "$GS_TEST_FAIL" | tail -1 | tr -d '\r')
-            GS_TEST_FAIL=${GS_TEST_FAIL:-0}
-            if [ "$GS_TEST_FAIL" -gt 0 ]; then
-                TEST_GATE_OK=0
-                TEST_FAILURES="${TEST_FAILURES}
-[Go GameServer Test Failures]
-$(echo "$GS_TEST_OUTPUT" | grep -E 'FAIL|Error|panic|---' | head -30)"
-                echo "  [TEST] Go GameServer: FAIL (${GS_TEST_FAIL} packages)"
-            else
-                echo "  [TEST] Go GameServer: PASS"
+                echo "  [TEST] Go: PASS"
             fi
         fi
 
@@ -1648,7 +1537,7 @@ ${TEST_FAILURES}
 - 只修复与本任务相关的测试失败
 - 修复后确保编译仍然通过
 - 不做额外重构或改动"
-            cli_call "$TEST_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10 || true
+            cli_call "$TEST_FIX_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -10
         fi
     done
 
@@ -1813,7 +1702,7 @@ if [ "$COMPLEXITY" = "M" ] && [ "$FAILED_TASKS" -gt 0 ] && [ -z "$UPGRADED_FROM"
         ML_FAILED=0
         for ML_TASK_FILE in $ML_TASK_FILES; do
             ML_TASK_BASENAME=$(basename "$ML_TASK_FILE" .md)
-            ML_TASK_NAME=$(grep "^name:" "$ML_TASK_FILE" | sed 's/^name: *//; s/^"//; s/"$//' || echo "$ML_TASK_BASENAME")
+            ML_TASK_NAME=$(grep "^name:" "$ML_TASK_FILE" | sed 's/^name: *//' || echo "$ML_TASK_BASENAME")
             ML_PRE_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
             ML_DEV_EXIT=0
             bash .claude/scripts/feature-develop-loop.sh "$VERSION_ID" "$FEATURE_NAME" --task "$ML_TASK_FILE" "$DEV_MAX_ROUNDS" || ML_DEV_EXIT=$?
@@ -2298,8 +2187,8 @@ if [ "$ACCEPTANCE_PASSED" = "true" ] && [ "$COMPLETED_TASKS" -gt 0 ]; then
 - 注释和文档用中文
 - 直接写文件，不要向用户提问"
 
-    DOC_EXIT=0
-    cli_call "$DOC_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20 || DOC_EXIT=$?
+    cli_call "$DOC_PROMPT" --permission-mode bypassPermissions 2>&1 | tail -20
+    DOC_EXIT=$?
 
     STAGE5_END=$(date +%s)
     STAGE5_DURATION=$((STAGE5_END - STAGE5_START))
@@ -2444,26 +2333,6 @@ cat >> "$WORK_LOG" << EOF
 | CLI 进程总数 | ${CLI_CALL_COUNT} |
 | 升级次数 | ${UPGRADE_COUNT} |
 EOF
-
-append_timing_to_output_docs
-
-TRACE_DIR="${FEATURE_DIR}/traces"
-if [ -d "$TRACE_DIR" ]; then
-    cat >> "$WORK_LOG" << EOF
-
-## Token 消耗统计
-
-> 说明：当前 Claude/Codex CLI trace 未暴露真实 provider usage；以下为基于 \`prompt_bytes/stdout_bytes\` 的近似值，估算公式为 \`ceil(bytes / 4)\`。真实 token 以供应商账单或 CLI 后续暴露的 usage 字段为准。
-
-EOF
-    if command -v python >/dev/null 2>&1; then
-        python .claude/scripts/trace_view.py "$TRACE_DIR" --markdown >> "$WORK_LOG" 2>/dev/null || echo "Token 统计生成失败：trace_view.py 执行失败" >> "$WORK_LOG"
-    elif command -v python3 >/dev/null 2>&1; then
-        python3 .claude/scripts/trace_view.py "$TRACE_DIR" --markdown >> "$WORK_LOG" 2>/dev/null || echo "Token 统计生成失败：trace_view.py 执行失败" >> "$WORK_LOG"
-    else
-        echo "Token 统计生成失败：未找到 python/python3，trace 位于 ${TRACE_DIR}" >> "$WORK_LOG"
-    fi
-fi
 
 echo ""
 echo "══════════════════════════════════════"
